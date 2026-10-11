@@ -1,0 +1,5 @@
+.build/
+.swiftpm/
+MeetCallRecorder.app/
+*.xcodeproj
+.DS_Store
