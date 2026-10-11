@@ -20,6 +20,13 @@ Black Hole Processing, but the sync target is just a folder).
   empirically: a sound played from an unrelated process during a test
   capture did not appear in the recording) scopes audio to that window's
   owning app, not the whole system. No OBS, no virtual audio driver.
+- **Compositing**: every frame is redrawn onto a fixed 1920x1080@30fps
+  canvas (`FrameComposer`) - the system desktop wallpaper as background,
+  the window scaled (preserving aspect ratio) to fit a centered 32px safe
+  area, regardless of the call window's actual size. Needs
+  `SCStreamConfiguration.shouldBeOpaque = false` on the source capture, or
+  the window's rounded corners/shadow come through as opaque black instead
+  of transparent.
 - **Output**: fragmented MP4 (`AVAssetWriter.movieFragmentInterval`) to a
   local staging directory - periodically closes out a playable chunk, so a
   crash mid-recording loses at most the last few seconds (confirmed: a
@@ -34,16 +41,17 @@ Black Hole Processing, but the sync target is just a folder).
 
 - macOS 14+.
 - **Screen Recording** permission (System Settings > Privacy & Security).
-  Prompted automatically on first launch. Ad-hoc code signing means the
-  binary's identity changes on every rebuild - if detection silently stops
-  working after a rebuild, toggle the permission off/on for
-  "MeetCallRecorder" rather than looking for a new prompt (TCC doesn't
-  always re-prompt for what looks like the same app).
+  Prompted automatically on first launch/build. `manage.sh build` signs
+  with a local self-signed identity (`setup-signing-identity.sh`, created
+  once, no sudo) rather than ad-hoc - ad-hoc signing hashes the binary
+  content itself as the identity, so TCC would otherwise treat every
+  rebuild as a brand new app and silently drop the grant. With a stable
+  identity, one grant survives rebuilds.
 
 ## Build & run
 
 ```sh
-Scripts/manage.sh build      # swift build -c release, package .app, ad-hoc sign
+Scripts/manage.sh build      # swift build -c release, package .app, sign with the local dev identity
 Scripts/manage.sh install    # build + install as a per-login LaunchAgent (RunAtLoad, no KeepAlive - respects manual Quit)
 Scripts/manage.sh update     # stop, rebuild, start - use after any code change
 Scripts/manage.sh status
