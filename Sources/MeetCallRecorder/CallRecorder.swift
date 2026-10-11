@@ -20,6 +20,14 @@ actor CallRecorder {
     private(set) var isRecording = false
     private(set) var currentOutputURL: URL?
 
+    // Fixed output canvas, independent of the actual call window's size -
+    // the window is scaled (preserving aspect ratio) to fit a centered
+    // safe area, system wallpaper filling whatever's left. See
+    // FrameComposer.
+    private static let outputSize = CGSize(width: 1920, height: 1080)
+    private static let safeInset: CGFloat = 32
+    private static let frameRate: Int32 = 30
+
     private static let filenameFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd HH-mm-ss"
@@ -42,7 +50,7 @@ actor CallRecorder {
         config.sampleRate = 48000
         config.channelCount = 2
         config.showsCursor = false
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 30)
+        config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(Self.frameRate))
 
         try? FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
         let filename = Self.filenameFormatter.string(from: Date()) + ".mp4"
@@ -57,8 +65,11 @@ actor CallRecorder {
 
         let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: config.width,
-            AVVideoHeightKey: config.height
+            AVVideoWidthKey: Int(Self.outputSize.width),
+            AVVideoHeightKey: Int(Self.outputSize.height),
+            AVVideoCompressionPropertiesKey: [
+                AVVideoExpectedSourceFrameRateKey: Self.frameRate
+            ]
         ])
         videoInput.expectsMediaDataInRealTime = true
         let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: [
@@ -70,7 +81,8 @@ actor CallRecorder {
         writer.add(videoInput)
         writer.add(audioInput)
 
-        let output = StreamOutput(writer: writer, videoInput: videoInput, audioInput: audioInput)
+        let composer = FrameComposer(outputSize: Self.outputSize, safeInset: Self.safeInset)
+        let output = StreamOutput(writer: writer, videoInput: videoInput, audioInput: audioInput, composer: composer)
         let scStream = SCStream(filter: filter, configuration: config, delegate: output)
         let queue = DispatchQueue(label: "dev.kriakiku.MeetCallRecorder.samples")
         try scStream.addStreamOutput(output, type: .screen, sampleHandlerQueue: queue)
@@ -109,12 +121,14 @@ private final class StreamOutput: NSObject, SCStreamOutput, SCStreamDelegate {
     let writer: AVAssetWriter
     let videoInput: AVAssetWriterInput
     let audioInput: AVAssetWriterInput
+    let composer: FrameComposer
     private var started = false
 
-    init(writer: AVAssetWriter, videoInput: AVAssetWriterInput, audioInput: AVAssetWriterInput) {
+    init(writer: AVAssetWriter, videoInput: AVAssetWriterInput, audioInput: AVAssetWriterInput, composer: FrameComposer) {
         self.writer = writer
         self.videoInput = videoInput
         self.audioInput = audioInput
+        self.composer = composer
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
@@ -126,7 +140,8 @@ private final class StreamOutput: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         switch type {
         case .screen:
-            if videoInput.isReadyForMoreMediaData { videoInput.append(sampleBuffer) }
+            guard videoInput.isReadyForMoreMediaData, let composed = composer.compose(sampleBuffer) else { return }
+            videoInput.append(composed)
         case .audio:
             if audioInput.isReadyForMoreMediaData { audioInput.append(sampleBuffer) }
         default:

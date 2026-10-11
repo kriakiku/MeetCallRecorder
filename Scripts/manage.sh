@@ -34,8 +34,7 @@ install() {
   sed "s#__APP_PATH__#${APP_BUNDLE}#g; s#__LABEL__#${LAUNCH_AGENT_LABEL}#g" \
     "${SCRIPT_DIR}/dev.kriakiku.MeetCallRecorder.plist.template" > "$LAUNCH_AGENT_PLIST"
   if launchctl print "gui/$(id -u)/${LAUNCH_AGENT_LABEL}" >/dev/null 2>&1; then
-    launchctl bootout "gui/$(id -u)/${LAUNCH_AGENT_LABEL}" 2>/dev/null || true
-    sleep 1
+    stop
   fi
   launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT_PLIST"
   echo "==> Installed and started."
@@ -44,8 +43,21 @@ install() {
 }
 
 start() { launchctl kickstart -k "gui/$(id -u)/${LAUNCH_AGENT_LABEL}"; }
-stop() { launchctl bootout "gui/$(id -u)/${LAUNCH_AGENT_LABEL}" 2>/dev/null || true; }
-restart() { stop; sleep 1; launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT_PLIST"; }
+
+# bootout returns before the process actually exits, so a quick
+# bootout-then-bootstrap can leave two instances both detecting the same
+# call and both recording it. Wait for the PID to actually disappear.
+stop() {
+  launchctl bootout "gui/$(id -u)/${LAUNCH_AGENT_LABEL}" 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    pgrep -f "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}" >/dev/null 2>&1 || return 0
+    sleep 0.5
+  done
+  echo "    still running after bootout - force killing"
+  pkill -9 -f "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}" 2>/dev/null || true
+}
+
+restart() { stop; launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT_PLIST"; }
 
 status() {
   launchctl print "gui/$(id -u)/${LAUNCH_AGENT_LABEL}" 2>&1 | grep -E "state|pid" || echo "not loaded"
