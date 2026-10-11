@@ -28,6 +28,18 @@ build() {
   echo "==> Built: ${APP_BUNDLE}"
 }
 
+# launchctl bootstrap right after a bootout occasionally hits a transient
+# "Input/output error" (seen in speakr-asr-wrapper too) - just retry once.
+bootstrap_with_retry() {
+  if ! launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT_PLIST" 2>/tmp/mcr-bootstrap-err; then
+    cat /tmp/mcr-bootstrap-err >&2
+    echo "    bootstrap failed, retrying once after a pause..."
+    sleep 2
+    launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT_PLIST"
+  fi
+  rm -f /tmp/mcr-bootstrap-err
+}
+
 install() {
   build
   echo "==> Writing LaunchAgent -> ${LAUNCH_AGENT_PLIST}"
@@ -36,7 +48,7 @@ install() {
   if launchctl print "gui/$(id -u)/${LAUNCH_AGENT_LABEL}" >/dev/null 2>&1; then
     stop
   fi
-  launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT_PLIST"
+  bootstrap_with_retry
   echo "==> Installed and started."
   echo "    If this is the first install, open the app once manually and grant"
   echo "    Screen Recording when prompted (System Settings > Privacy & Security)."
@@ -57,7 +69,7 @@ stop() {
   pkill -9 -f "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}" 2>/dev/null || true
 }
 
-restart() { stop; launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT_PLIST"; }
+restart() { stop; bootstrap_with_retry; }
 
 status() {
   launchctl print "gui/$(id -u)/${LAUNCH_AGENT_LABEL}" 2>&1 | grep -E "state|pid" || echo "not loaded"

@@ -51,6 +51,12 @@ actor CallRecorder {
         config.channelCount = 2
         config.showsCursor = false
         config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(Self.frameRate))
+        // Without this, ScreenCaptureKit fills everything outside the
+        // window's actual shape (rounded corners, drop shadow) with opaque
+        // black instead of leaving it transparent - shouldBeOpaque=false
+        // keeps an alpha channel so FrameComposer's compositing shows the
+        // wallpaper through the corners instead of black squares.
+        config.shouldBeOpaque = false
 
         try? FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
         let filename = Self.filenameFormatter.string(from: Date()) + ".mp4"
