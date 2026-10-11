@@ -1,11 +1,10 @@
 #!/opt/homebrew/bin/bash
 # Build, package, and (un)install MeetCallRecorder as a per-user login item.
 #
-# Ad-hoc codesign (-s -) hashes the binary itself, so every rebuild is a
-# "new" identity to TCC - after `build`/`install`, macOS may silently stop
-# granting Screen Recording even though System Settings still shows it
-# enabled. If detection stops working after a rebuild, toggle it off/on in
-# System Settings > Privacy & Security > Screen Recording.
+# Signed with a local self-signed identity (setup-signing-identity.sh),
+# not ad-hoc (-s -) - ad-hoc hashes the binary itself, so every rebuild
+# would be a "new" identity to TCC and silently lose the Screen Recording
+# grant. A real identity (even self-signed) stays stable across rebuilds.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,8 +14,10 @@ BUNDLE_ID="dev.kriakiku.MeetCallRecorder"
 APP_BUNDLE="${REPO_DIR}/${APP_NAME}.app"
 LAUNCH_AGENT_LABEL="${BUNDLE_ID}"
 LAUNCH_AGENT_PLIST="${HOME}/Library/LaunchAgents/${LAUNCH_AGENT_LABEL}.plist"
+SIGNING_IDENTITY="MeetCallRecorder Local Dev"
 
 build() {
+  "${SCRIPT_DIR}/setup-signing-identity.sh"
   echo "==> Building (release)..."
   swift build -c release --package-path "$REPO_DIR"
   echo "==> Packaging ${APP_NAME}.app..."
@@ -24,7 +25,7 @@ build() {
   mkdir -p "${APP_BUNDLE}/Contents/MacOS"
   cp "${REPO_DIR}/.build/release/${APP_NAME}" "${APP_BUNDLE}/Contents/MacOS/"
   cp "${SCRIPT_DIR}/Info.plist" "${APP_BUNDLE}/Contents/Info.plist"
-  codesign --force --deep -s - "$APP_BUNDLE"
+  codesign --force --deep -s "$SIGNING_IDENTITY" "$APP_BUNDLE"
   echo "==> Built: ${APP_BUNDLE}"
 }
 
@@ -86,7 +87,7 @@ uninstall() {
 case "${1:-}" in
   build) build ;;
   install) install ;;
-  update) stop; build; start ;;
+  update) stop; build; bootstrap_with_retry ;;
   start) start ;;
   stop) stop ;;
   restart) restart ;;
