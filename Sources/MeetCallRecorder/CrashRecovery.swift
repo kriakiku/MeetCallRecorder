@@ -31,6 +31,11 @@ enum CrashRecovery {
         /// The identifier stamped on this call's frames - read back so
         /// the segments written after a restart carry the same one.
         let recordingID: String
+        /// What these segments were actually captured at. Read back
+        /// rather than taken from the current setting: changing quality
+        /// between the crash and the restart must not change the canvas
+        /// a half-recorded call is assembled onto.
+        let quality: RecordingQuality
     }
 
     // MARK: - Call folders
@@ -53,13 +58,15 @@ enum CrashRecovery {
         let startDate: Date
         let closedDuration: TimeInterval
         let recordingID: String
+        let quality: RecordingQuality
 
-        init(ownerName: String, callID: String, startDate: Date, closedDuration: TimeInterval, recordingID: String) {
+        init(ownerName: String, callID: String, startDate: Date, closedDuration: TimeInterval, recordingID: String, quality: RecordingQuality) {
             self.ownerName = ownerName
             self.callID = callID
             self.startDate = startDate
             self.closedDuration = closedDuration
             self.recordingID = recordingID
+            self.quality = quality
         }
 
         init(from decoder: Decoder) throws {
@@ -69,6 +76,9 @@ enum CrashRecovery {
             startDate = try container.decode(Date.self, forKey: .startDate)
             closedDuration = try container.decodeIfPresent(TimeInterval.self, forKey: .closedDuration) ?? 0
             recordingID = try container.decodeIfPresent(String.self, forKey: .recordingID) ?? RecordingID.generate()
+            // Absent in metas written before quality was selectable, and
+            // everything written then was 1080p.
+            quality = try container.decodeIfPresent(RecordingQuality.self, forKey: .quality) ?? .p1080
         }
     }
 
@@ -108,13 +118,14 @@ enum CrashRecovery {
         folder.appendingPathComponent("call.json")
     }
 
-    static func writeCallMeta(folder: URL, ownerName: String, callID: String, startDate: Date, closedDuration: TimeInterval, recordingID: String) {
+    static func writeCallMeta(folder: URL, ownerName: String, callID: String, startDate: Date, closedDuration: TimeInterval, recordingID: String, quality: RecordingQuality) {
         let meta = CallMeta(
             ownerName: ownerName,
             callID: callID,
             startDate: startDate,
             closedDuration: closedDuration,
-            recordingID: recordingID
+            recordingID: recordingID,
+            quality: quality
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -200,7 +211,8 @@ enum CrashRecovery {
                 callID: meta.callID,
                 startDate: meta.startDate,
                 closedDuration: meta.closedDuration,
-                recordingID: meta.recordingID
+                recordingID: meta.recordingID,
+                quality: meta.quality
             ))
         }
         return result

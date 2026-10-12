@@ -83,9 +83,20 @@ enum RecordingAssembler {
     /// and a failure partway leaves its debris with the call it belongs
     /// to, where retrying picks it up and the folder's eventual deletion
     /// takes it away.
-    static func assemble(segments: [URL], durations: [Double], inserts: [Insert], recordingID: CGImage?, metadata: RecordingMetadata, scratch: URL, to destination: URL) async -> Bool {
+    static func assemble(segments: [URL], durations: [Double], inserts: [Insert], recordingID: CGImage?, metadata: RecordingMetadata, quality: RecordingQuality, background: CGImage?, scratch: URL, to destination: URL) async -> Bool {
         guard !segments.isEmpty else { return false }
-        let outputSize = CallRecorder.outputSize
+
+        // Audio-only recordings have no canvas, no plates and no video
+        // track to carry them, so none of the compositing below applies -
+        // the whole job is concatenating what was captured.
+        guard let outputSize = quality.outputSize else {
+            return await assembleAudioOnly(
+                segments: segments,
+                metadata: metadata,
+                scratch: scratch,
+                to: destination
+            )
+        }
         let fm = FileManager.default
         let tempURL = scratch.appendingPathComponent(destination.lastPathComponent + ".video")
         try? fm.removeItem(at: tempURL)
@@ -126,7 +137,7 @@ enum RecordingAssembler {
                 AVVideoHeightKey: Int(outputSize.height),
                 AVVideoCompressionPropertiesKey: [
                     AVVideoExpectedSourceFrameRateKey: CallRecorder.frameRate,
-                    AVVideoAverageBitRateKey: CallRecorder.outputBitrate
+                    AVVideoAverageBitRateKey: quality.outputBitrate
                 ]
             ])
             // Nothing here is real time: the writer is allowed to make us
@@ -150,6 +161,7 @@ enum RecordingAssembler {
                     startingAt: cursor,
                     frozen: frozen,
                     recordingID: recordingID,
+                    background: background,
                     outputSize: outputSize,
                     pool: pool,
                     context: context,
@@ -163,7 +175,7 @@ enum RecordingAssembler {
             if let outro {
                 let outroStart = cursor
                 cursor = try await appendPlate(
-                    plate(outro, over: frozen, recordingID: recordingID, outputSize: outputSize),
+                    plate(outro, over: frozen, recordingID: recordingID, background: background, outputSize: outputSize),
                     over: frozen,
                     startingAt: cursor,
                     fadeIn: true,
@@ -368,6 +380,63 @@ enum RecordingAssembler {
         return true
     }
 
+    // MARK: - Audio-only
+
+    /// Concatenates the segments' audio into one `.m4a`, metadata and all.
+    ///
+    /// Shares nothing with the video path on purpose. There is no canvas
+    /// to render, no plate to draw and no silence to splice - plates exist
+    /// to cover a gap in the *picture*, and without a picture a pause is
+    /// just two pieces of audio meeting. So this is a stream-copy concat
+    /// and a metadata stamp, which is also why it finishes in well under a
+    /// second where the video path takes tens of them.
+    private static func assembleAudioOnly(segments: [URL], metadata: RecordingMetadata, scratch: URL, to destination: URL) async -> Bool {
+        let fm = FileManager.default
+        let runID = UUID().uuidString
+        var temporary: [URL] = []
+        defer { for file in temporary { try? fm.removeItem(at: file) } }
+
+        // Staged segments are QuickTime containers holding an AAC track.
+        // Each is re-wrapped as MP4 before the concat demuxer sees it:
+        // concat wants a consistent container, and a stream copy into mp4
+        // costs nothing.
+        var pieces: [URL] = []
+        for (index, segment) in segments.enumerated() {
+            let piece = scratch.appendingPathComponent(".audio-\(runID)-\(index).m4a")
+            guard await CrashRecovery.runFFmpegArgs([
+                "-y", "-i", segment.path, "-vn", "-c:a", "copy",
+                "-avoid_negative_ts", "make_zero", "-f", "mp4", piece.path
+            ]), fm.fileExists(atPath: piece.path) else {
+                log("assemble: no audio in \(segment.lastPathComponent) - skipping it")
+                continue
+            }
+            temporary.append(piece)
+            pieces.append(piece)
+        }
+        guard !pieces.isEmpty else {
+            log("assemble: audio-only call had no audio at all")
+            return false
+        }
+
+        let listFile = scratch.appendingPathComponent(".audio-\(runID).txt")
+        let list = pieces.map { "file '\($0.path.replacingOccurrences(of: "'", with: "'\\''"))'" }
+            .joined(separator: "\n") + "\n"
+        guard (try? list.write(to: listFile, atomically: true, encoding: .utf8)) != nil else { return false }
+        temporary.append(listFile)
+
+        let assembled = scratch.appendingPathComponent(destination.lastPathComponent + ".assembling")
+        try? fm.removeItem(at: assembled)
+        guard await CrashRecovery.runFFmpegArgs([
+            "-y", "-f", "concat", "-safe", "0", "-i", listFile.path, "-c", "copy"
+        ] + containerMetadataArguments(metadata, overlaySpans: []) + ["-f", "mp4", assembled.path]),
+            fm.fileExists(atPath: assembled.path) else {
+            log("assemble: audio concat failed")
+            try? fm.removeItem(at: assembled)
+            return false
+        }
+        return move(assembled, to: destination)
+    }
+
     // MARK: - Segments
 
     private struct SegmentResult {
@@ -384,6 +453,7 @@ enum RecordingAssembler {
         startingAt start: CMTime,
         frozen: CVPixelBuffer?,
         recordingID: CGImage?,
+        background: CGImage?,
         outputSize: CGSize,
         pool: CVPixelBufferPool,
         context: CIContext,
@@ -455,7 +525,7 @@ enum RecordingAssembler {
                 pending.removeFirst()
                 // Built once: it is both what gets held, and what fades
                 // back out over the frames that follow.
-                let plateImage = plate(next, over: lastFrame, recordingID: recordingID, outputSize: outputSize)
+                let plateImage = plate(next, over: lastFrame, recordingID: recordingID, background: background, outputSize: outputSize)
 
                 guard next.event.kind != .resize else {
                     // No frames of its own, and no fade in. The picture
@@ -556,7 +626,7 @@ enum RecordingAssembler {
         for insert in pending where insert.event.kind != .resize {
             let plateStart = cursor
             cursor = try await appendPlate(
-                plate(insert, over: lastFrame, recordingID: recordingID, outputSize: outputSize),
+                plate(insert, over: lastFrame, recordingID: recordingID, background: background, outputSize: outputSize),
                 over: lastFrame,
                 startingAt: cursor,
                 fadeIn: insert.event.kind != .intro,
@@ -584,7 +654,7 @@ enum RecordingAssembler {
 
     // MARK: - Plates
 
-    private static func plate(_ insert: Insert, over frozen: CVPixelBuffer?, recordingID: CGImage?, outputSize: CGSize) -> CIImage {
+    private static func plate(_ insert: Insert, over frozen: CVPixelBuffer?, recordingID: CGImage?, background: CGImage?, outputSize: CGSize) -> CIImage {
         let still = frozen.flatMap { buffer -> CGImage? in
             let context = CIContext()
             return context.createCGImage(CIImage(cvPixelBuffer: buffer), from: CGRect(origin: .zero, size: outputSize))
@@ -594,6 +664,7 @@ enum RecordingAssembler {
             // The welcome plate gets the wallpaper alone: it isn't
             // standing in for a picture that was just there.
             still: insert.event.kind == .intro ? nil : still,
+            background: background,
             outputSize: outputSize,
             safeInset: CallRecorder.safeInset,
             recordingID: recordingID

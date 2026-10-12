@@ -5,12 +5,14 @@ import Foundation
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private let recorder = CallRecorder()
+    private let welcome = WelcomeWindowController()
+    private let settings = SettingsWindowController()
     /// Finished recordings land here. Calls still in progress live under
     /// `stagingDir` until their segments are merged and the result moved
     /// up here.
     private let recordingsDir = URL(fileURLWithPath: NSString(string: "~/Movies/MeetCallRecorder").expandingTildeInPath)
     private var stagingDir: URL { recordingsDir.appendingPathComponent("staging") }
-    private let logURL = URL(fileURLWithPath: NSString(string: "~/Library/Logs/MeetCallRecorder.log").expandingTildeInPath)
+    private var logURL: URL { Log.url }
 
     // How long a call stays open - and resumable - after its window was
     // last seen. Rejoining within the window, or bouncing to another call
@@ -35,6 +37,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let startDate: Date
         /// Stamped on every frame of this call and written into its meta.
         let recordingID: String
+        /// Read from Settings when the call opened and then left alone.
+        /// A call keeps the canvas and the backdrop it started with: a
+        /// setting changed mid-meeting would otherwise resize the output
+        /// between two segments of the same recording.
+        let quality: RecordingQuality
+        /// Already cover-fitted to `quality.outputSize`; nil for
+        /// audio-only, and for a desktop with no picture set.
+        let background: CGImage?
         var icon: NSImage?
         /// Content duration of the segments already closed - the recorder
         /// only knows about the one it's writing right now.
@@ -48,18 +58,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// The call the recorder is writing right now, if any.
     private var activeKey: String?
 
-    private var cachedResizeCard: CGImage?
+    private var cachedResizeCards: [String: CGImage] = [:]
     private var cachedRecordingIDs: [String: CGImage] = [:]
 
     private var pollTask: Task<Void, Never>?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        // Before anything can hand us a grant mid-session - that's the
+        // distinction the welcome screen's restart prompt rests on.
+        PermissionCoordinator.captureLaunchState()
         setupStatusItem()
         log("MeetCallRecorder starting")
+        // There's no read-only CLI for a login item's registration state,
+        // so this line is the only way to check autostart from outside
+        // System Settings. Scripts/manage.sh status reads it back.
+        log("launch at login: \(LaunchAtLogin.state)")
+
+        // Detection doesn't start until the grants are in. Without Screen
+        // Recording, `CGWindowListCopyWindowInfo` returns every window
+        // with an empty title, so the poll loop would run forever and
+        // recognise nothing - a menu bar icon that looks healthy and
+        // records nothing. The welcome screen is the honest version of
+        // that state.
+        if Onboarding.isNeeded {
+            log("permissions incomplete - showing welcome screen")
+            showWelcome()
+        } else {
+            startDetection()
+        }
+    }
+
+    /// Begins the detect-and-record loop. Idempotent: reaching the end of
+    /// the welcome flow calls it, and so does a launch that didn't need
+    /// the welcome flow at all.
+    private func startDetection() {
+        guard pollTask == nil else { return }
+        log("detection started")
         pollTask = Task { @MainActor in
             await self.recoverStaleCalls()
             await self.pollLoop()
+        }
+    }
+
+    private func showWelcome() {
+        welcome.show { [weak self] in
+            self?.startDetection()
         }
     }
 
@@ -107,6 +151,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         menu.addItem(withTitle: "Open Recordings Folder", action: #selector(openRecordings), keyEquivalent: "")
         menu.addItem(withTitle: "Open Logs", action: #selector(openLogs), keyEquivalent: "")
+        menu.addItem(withTitle: "Setup & Permissions…", action: #selector(openWelcome), keyEquivalent: "")
+        menu.addItem(withTitle: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
         menu.addItem(.separator())
         menu.addItem(withTitle: "Quit", action: #selector(quit), keyEquivalent: "q")
         for item in menu.items { item.target = self }
@@ -140,6 +186,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @objc private func openSettings() {
+        settings.show()
+    }
+
     @objc private func forceStop() {
         Task { @MainActor in
             guard let key = activeKey else { return }
@@ -154,6 +204,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openLogs() {
         NSWorkspace.shared.open(logURL)
+    }
+
+    @objc private func openWelcome() {
+        showWelcome()
     }
 
     @objc private func quit() {
@@ -174,9 +228,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func pollOnce() async {
-        let meet = WindowDetector.findWindow(ownerName: "Google Meet", titlePrefix: "Meet: ")
-        let slack = WindowDetector.findWindow(ownerName: "Slack", titlePrefix: "Huddle")
-        let visible = meet ?? slack
+        // Nothing visible rather than an early return, in both the
+        // manual case and the nothing-enabled case. The rest of this
+        // function is what winds an open call down - grace clock, then
+        // sweepExpired - so bailing out here would strand a call that was
+        // recording at the moment the setting changed: it would never be
+        // finalized and would sit in staging until the next launch
+        // recovered it.
+        //
+        // Manual capture is driven entirely from the menu and isn't built
+        // yet; see Settings.captureMode.
+        let visible: DetectedWindow? = Settings.shared.captureMode == .automatic
+            // In the order CallSource declares them, so Meet wins over
+            // Slack when both are somehow on screen - the same precedence
+            // the hardcoded pair had.
+            ? CallSource.allCases
+                .filter { Settings.shared.isEnabled($0) }
+                .lazy
+                .compactMap { WindowDetector.findWindow(ownerName: $0.ownerName, titlePrefix: $0.titlePrefix) }
+                .first
+            : nil
         let visibleKey = visible.map { Self.callKey(ownerName: $0.ownerName, callID: $0.callID) }
 
         // Anything not on screen right now starts counting towards its
@@ -268,20 +339,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let startDate = Date()
         let recordingID = RecordingID.generate()
+        let quality = Settings.shared.quality
         CrashRecovery.writeCallMeta(
             folder: folder,
             ownerName: window.ownerName,
             callID: window.callID,
             startDate: startDate,
             closedDuration: 0,
-            recordingID: recordingID
+            recordingID: recordingID,
+            quality: quality
         )
+        // Resolved before the first segment opens, and awaited: the photo
+        // modes go to the network, and the composer runs in the sample
+        // path where nothing can wait. Worst case this delays the start of
+        // the recording by a download; BackgroundLibrary caches hard and
+        // falls back to a generated gradient rather than hanging on a
+        // failure.
+        let background = await backgroundImage(for: quality, seed: Self.backgroundSeed(ownerName: window.ownerName, callID: window.callID))
         openCalls[key] = OpenCall(
             ownerName: window.ownerName,
             callID: window.callID,
             folder: folder,
             startDate: startDate,
             recordingID: recordingID,
+            quality: quality,
+            background: background,
             icon: NSRunningApplication(processIdentifier: window.pid)?.icon
         )
         await startSegment(window: window, key: key, gap: 0)
@@ -309,7 +391,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let url = CrashRecovery.nextSegmentURL(in: call.folder)
         do {
-            _ = try await recorder.start(window: window, outputURL: url)
+            _ = try await recorder.start(window: window, outputURL: url, quality: call.quality, background: call.background)
             activeKey = key
             if let openingEvent {
                 RecordingTimeline.append(
@@ -351,7 +433,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             callID: call.callID,
             startDate: call.startDate,
             closedDuration: call.closedDuration,
-            recordingID: call.recordingID
+            recordingID: call.recordingID,
+            quality: call.quality
         )
         openCalls[key] = call
     }
@@ -436,12 +519,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // the only thing deliberately left out, since they're ours, not
         // the meeting's.
         let meetingDuration = totalDuration + events.reduce(0) { $0 + ($1.kind == .pause ? ($1.gap ?? 0) : 0) }
-        if let outro = TitleCardRenderer.renderOutro(
+        // nil for audio-only, where there is no outro plate to draw and
+        // nothing below this builds one.
+        let outputSize = call.quality.outputSize ?? CallRecorder.defaultOutputSize
+        if let outro = call.quality.outputSize == nil ? nil : TitleCardRenderer.renderOutro(
             appIcon: call.icon,
             appName: call.ownerName,
             callID: call.callID,
             meetingDuration: meetingDuration,
-            outputSize: CallRecorder.outputSize
+            outputSize: outputSize
         ) {
             // Positioned after everything; the segment it names is only
             // there to say which one it follows.
@@ -487,6 +573,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 meetingID: call.callID,
                 recordingID: call.recordingID
             ),
+            quality: call.quality,
+            background: call.background,
             scratch: call.folder,
             to: destination
         ) {
@@ -503,6 +591,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// The transparent icon/text for a logged event. The assembler puts
     /// it on whatever backdrop that kind of plate calls for.
     private func plateContent(for event: TimelineEvent, call: OpenCall) -> CGImage? {
+        guard let outputSize = call.quality.outputSize else { return nil }
         switch event.kind {
         case .intro:
             return TitleCardRenderer.renderIntro(
@@ -510,14 +599,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 appName: call.ownerName,
                 callID: call.callID,
                 startDate: call.startDate,
-                outputSize: CallRecorder.outputSize
+                outputSize: outputSize
             )
         case .pause:
-            return TitleCardRenderer.renderGap(pauseDuration: event.gap ?? 0, outputSize: CallRecorder.outputSize)
+            return TitleCardRenderer.renderGap(pauseDuration: event.gap ?? 0, outputSize: outputSize)
         case .resize:
             // Cached: a call can log a resize every time the window is
             // nudged, and the card is the same one every time.
-            return resizeCardImage()
+            return resizeCardImage(outputSize: outputSize)
         case .outro:
             // Built by the caller, which is the only place that knows the
             // whole call's duration.
@@ -534,12 +623,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         CrashRecovery.prepareStagingDirectory(stagingDir)
         for stale in CrashRecovery.findStaleCalls(in: stagingDir) {
             let key = Self.callKey(ownerName: stale.ownerName, callID: stale.callID)
+            // Re-resolved rather than persisted: the seeded modes hand
+            // back the same picture, and for the unseeded ones a recovered
+            // call getting a fresh backdrop is harmless - the plates drawn
+            // at assembly are the only thing that uses it from here.
+            let background = await backgroundImage(
+                for: stale.quality,
+                seed: Self.backgroundSeed(ownerName: stale.ownerName, callID: stale.callID)
+            )
             openCalls[key] = OpenCall(
                 ownerName: stale.ownerName,
                 callID: stale.callID,
                 folder: stale.folder,
                 startDate: stale.startDate,
                 recordingID: stale.recordingID,
+                quality: stale.quality,
+                background: background,
                 icon: Self.icon(forAppNamed: stale.ownerName),
                 closedDuration: stale.closedDuration,
                 missingSince: CrashRecovery.lastWrite(in: stale.folder)
@@ -548,10 +647,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func resizeCardImage() -> CGImage? {
-        if let cachedResizeCard { return cachedResizeCard }
-        let image = TitleCardRenderer.renderResize(outputSize: CallRecorder.outputSize)
-        cachedResizeCard = image
+    /// nil for audio-only (no canvas to fill) and whenever the chosen
+    /// mode can't produce anything - the composer treats that as black.
+    private func backgroundImage(for quality: RecordingQuality, seed: String) async -> CGImage? {
+        guard let outputSize = quality.outputSize else { return nil }
+        return await BackgroundLibrary.shared.background(
+            mode: Settings.shared.background,
+            seed: seed,
+            size: outputSize
+        )
+    }
+
+    /// What the per-meeting background modes hash. The app name is in it
+    /// as well as the call ID because a Slack huddle's "ID" is just its
+    /// window title, which is not unique across apps.
+    private static func backgroundSeed(ownerName: String, callID: String) -> String {
+        "\(ownerName)|\(callID)"
+    }
+
+    private func resizeCardImage(outputSize: CGSize) -> CGImage? {
+        // Keyed by size now that there is more than one canvas - the same
+        // card at 720p and 1440p are different bitmaps.
+        let key = "\(Int(outputSize.width))x\(Int(outputSize.height))"
+        if let cached = cachedResizeCards[key] { return cached }
+        guard let image = TitleCardRenderer.renderResize(outputSize: outputSize) else { return nil }
+        cachedResizeCards[key] = image
         return image
     }
 
@@ -586,7 +706,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// zas-rvho-gkt.mp4" or "2026-10-11 22-37-05 Slack Huddle.mp4".
     private static func finalFilename(for call: OpenCall) -> String {
         let date = filenameFormatter.string(from: call.startDate)
-        return "\(date) \(sanitized("\(call.ownerName) \(call.callID)")).mp4"
+        return "\(date) \(sanitized("\(call.ownerName) \(call.callID)")).\(call.quality.fileExtension)"
     }
 
     /// "/" and ":" are stripped - a call ID or app name is free to contain
@@ -604,16 +724,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Logging
 
     private func log(_ message: String) {
-        let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
-        print(line, terminator: "")
-        guard let data = line.data(using: .utf8) else { return }
-        if !FileManager.default.fileExists(atPath: logURL.path) {
-            try? FileManager.default.createDirectory(at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            FileManager.default.createFile(atPath: logURL.path, contents: nil)
-        }
-        guard let handle = try? FileHandle(forWritingTo: logURL) else { return }
-        defer { try? handle.close() }
-        handle.seekToEndOfFile()
-        handle.write(data)
+        Log.write(message)
     }
 }

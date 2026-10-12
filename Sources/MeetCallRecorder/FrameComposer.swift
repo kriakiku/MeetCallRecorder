@@ -5,7 +5,7 @@ import CoreVideo
 import ScreenCaptureKit
 
 /// Composites each captured window frame onto a fixed-size canvas: the
-/// system desktop wallpaper as background, the window scaled (preserving
+/// call's chosen background, the window scaled (preserving
 /// aspect ratio) to fit within a centered safe area, never touching the
 /// `safeInset`-pixel margin. Output is always `outputSize` regardless of
 /// the window's actual size - that's the point (fixed 1920x1080/30fps
@@ -95,10 +95,15 @@ final class FrameComposer {
     /// What `repeatLastFrame` copies from.
     private var lastOutputBuffer: CVPixelBuffer?
 
-    init(outputSize: CGSize, safeInset: CGFloat) {
+    /// `background` arrives already cover-fitted to `outputSize` - see
+    /// BackgroundLibrary, which resolves it once per call. It's passed in
+    /// rather than loaded here because the photo modes go to the network,
+    /// and nothing on the sample path can wait on that. Nil means black,
+    /// which is also what a desktop with no picture set gets.
+    init(outputSize: CGSize, safeInset: CGFloat, background: CGImage?) {
         self.outputSize = outputSize
         self.safeInset = safeInset
-        self.backgroundImage = Self.loadDesktopWallpaper(fitting: outputSize)
+        self.backgroundImage = background.map { CIImage(cgImage: $0) }
             ?? CIImage(color: .black).cropped(to: CGRect(origin: .zero, size: outputSize))
         self.pixelBufferPool = Self.makePixelBufferPool(size: outputSize)
     }
@@ -126,22 +131,6 @@ final class FrameComposer {
             translationX: outputSize.width - gap - stamp.extent.width + padding,
             y: gap - padding
         ))
-    }
-
-    private static func loadDesktopWallpaper(fitting size: CGSize) -> CIImage? {
-        guard let screen = NSScreen.main,
-              let url = NSWorkspace.shared.desktopImageURL(for: screen),
-              let image = CIImage(contentsOf: url) else {
-            return nil
-        }
-        // Cover-fit: scale up to fill `size` entirely, then crop any excess.
-        let scale = max(size.width / image.extent.width, size.height / image.extent.height)
-        let scaled = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-        let dx = (scaled.extent.width - size.width) / 2 - scaled.extent.minX
-        let dy = (scaled.extent.height - size.height) / 2 - scaled.extent.minY
-        return scaled
-            .transformed(by: CGAffineTransform(translationX: -dx, y: -dy))
-            .cropped(to: CGRect(origin: .zero, size: size))
     }
 
     private static func makePixelBufferPool(size: CGSize) -> CVPixelBufferPool? {
@@ -327,12 +316,14 @@ final class FrameComposer {
 
     /// Composites `card` over a blurred, darkened `still` - the look every
     /// plate shares, from the welcome card to the one held up while the
-    /// window is being resized. Falls back to the desktop wallpaper when
-    /// there's no still to use.
-    static func composeCardOverStill(card: CGImage, still: CGImage?, outputSize: CGSize, safeInset: CGFloat, recordingID: CGImage?) -> CGImage? {
+    /// window is being resized. Falls back to the call's background when
+    /// there's no still to use, which is the welcome plate's case: it
+    /// isn't standing in for a picture that was just there, so it gets the
+    /// same backdrop the recording itself is about to sit on.
+    static func composeCardOverStill(card: CGImage, still: CGImage?, background: CGImage?, outputSize: CGSize, safeInset: CGFloat, recordingID: CGImage?) -> CGImage? {
         let canvas = CGRect(origin: .zero, size: outputSize)
         let base = still.map { CIImage(cgImage: $0) }
-            ?? loadDesktopWallpaper(fitting: outputSize)
+            ?? background.map { CIImage(cgImage: $0) }
             ?? CIImage(color: .black).cropped(to: canvas)
 
         let backdrop = blurred(base.cropped(to: canvas), radius: cardBackdropBlurRadius, clippedTo: canvas)

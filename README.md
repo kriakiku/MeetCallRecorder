@@ -127,32 +127,182 @@ the whole screen or system audio. Finished recordings are left in
 
 - macOS 26+ (AVAssetWriter's input receiver API).
 - **Screen Recording** permission (System Settings > Privacy & Security).
-  Prompted automatically on first launch/build. `manage.sh build` signs
-  with a local self-signed identity (`setup-signing-identity.sh`, created
-  once, no sudo) rather than ad-hoc - ad-hoc signing hashes the binary
-  content itself as the identity, so TCC would otherwise treat every
-  rebuild as a brand new app and silently drop the grant. With a stable
-  identity, one grant survives rebuilds.
+  Asked for by the welcome screen, not at startup - see below. Nothing
+  works without it: ScreenCaptureKit needs it to capture a window, and
+  `CGWindowListCopyWindowInfo` needs it to return window *titles*, which
+  is how a call is recognised at all. Without the grant every window comes
+  back with an empty name and the detector matches nothing, so the app
+  looks healthy and records nothing.
+- `manage.sh build` signs with a local self-signed identity
+  (`setup-signing-identity.sh`, created once, no sudo) rather than ad-hoc
+  - ad-hoc signing hashes the binary content itself as the identity, so
+  TCC would otherwise treat every rebuild as a brand new app and silently
+  drop the grant. With a stable identity, one grant survives rebuilds.
+
+## Welcome screen
+
+First launch - and any later launch where a required grant has gone
+missing - opens a two-page setup window instead of going straight to
+detection:
+
+1. The app mark, name and what it does.
+2. The permissions, each with its own Allow button and live status, plus a
+   **Start MeetCallRecorder at login** switch (on by default).
+
+Granting Screen Recording costs one relaunch: macOS only hands a new TCC
+grant to a process at launch, so the running copy still can't capture
+after the switch is flipped. The screen detects this - a grant that
+appeared *during this session* is treated as not-yet-usable - and offers a
+Restart button rather than letting Continue through into an app that would
+record nothing. The relaunch lands back on page two, not on the greeting.
+
+Reachable any time from the menu bar: **Setup & Permissions…**.
+
+Autostart is the switch on that page, via `SMAppService` - the app appears
+under System Settings > General > Login Items and can be turned off there.
+It used to be a LaunchAgent plist written by `manage.sh`, which meant the
+installer and the app each owned half of the same setting; `manage.sh
+migrate` (also run by `install`) removes the leftover plist.
+
+## Settings
+
+**Settings…** in the menu bar, four tabs. Everything persists on change -
+there is no apply button. Nothing reaches a recording already in progress:
+a call captures its quality and background when it opens, so a change here
+takes effect from the next call.
+
+### Quality
+
+720p / 1080p (default) / 1440p / **Audio only**. Bitrate scales with pixel
+count off the hand-tuned 1080p pair (12 Mbps staged, 5 Mbps final) - by
+area, not by height, or 1440p would come out starved.
+
+Audio only writes `.m4a` and skips the video half of the pipeline
+entirely: no canvas, no composer, no screen output registered on the
+SCStream, and no plates at assembly. Plates exist to cover a gap in the
+*picture*; without one, a pause is just two pieces of audio meeting. That
+path is a stream-copy concat and a metadata stamp, so it finishes in well
+under a second where the video path takes tens of them.
+
+The quality a call was captured at is written into its staging meta, so a
+call recovered after a crash is assembled onto the canvas its segments
+actually have, not whatever the setting says by then.
+
+### Capture
+
+**Automatic** watches for call windows, per source - Google Meet and Slack
+huddles can be turned off independently. **Manual** (start/stop by hand,
+whole main display plus the default microphone) is a stub: the setting is
+there and disabled, nothing behind it yet.
+
+Switching to manual, or turning every source off, deliberately does not
+stop the poll loop - it only stops it *seeing* anything. The rest of the
+loop is what winds an open call down, so a call that was recording at the
+moment the setting changed still finalizes through its normal grace
+period instead of being stranded in staging.
+
+### Background
+
+What fills the margin around the scaled call window.
+
+1. **Desktop picture** - the default; what the app always did.
+2. **Cutting mat** - a drawn blue board with grid, angle guides and edge
+   ticks. No network, identical every time.
+3. **Random photo** - a different wallhaven.cc wallpaper each call.
+4. **Photo per meeting** - the same source, picked from a hash of the
+   meeting ID, so one recurring huddle keeps its picture.
+5. **Gradient per meeting** - an abstract gradient generated from the
+   meeting ID. Stable per meeting, never touches the network.
+
+Resolved once per call before the first segment opens, and awaited - the
+composer runs in the sample path, where nothing can wait on a download.
+
+#### Notes on the two generated ones
+
+The gradient is **bezier ribbons**, not stacked radial gradients. A radial
+gradient's boundary is a circle, so stacking them can only ever produce
+concentric haze; the mesh-gradient look it's chasing is colour regions
+meeting along *curves*. Each ribbon is a very wide cubic bezier stroke
+that enters and leaves off-canvas (so no round cap is ever visible in
+frame), drawn opaque, and then blurred at ~8.5% of the canvas height -
+at that radius a stroke edge stops being an edge and becomes the
+transition between two colour fields. The first ribbon is deliberately
+the widest and routed through the middle, because without that guarantee
+some seeds put every curve out past a corner and left the canvas as bare
+base gradient.
+
+Hue is the part that took three goes. Clamping everything within ±40° of a
+base and blending additively over a near-black floor gave a flat
+single-colour wash - the base hue won every time. Opening the spread up
+put half the seeds in the amber/yellow-green band, which is brown and
+olive at the brightnesses a background behind a call window has to sit at.
+The fix after that - giving each hue arc a permitted *direction* to walk -
+could not work either, and it's worth saying why: some harmony templates
+contained both signs (`[0, 0.11, -0.08]`), so they walked both ways
+regardless of what the direction said, which is where the chartreuse rings
+and brown smears came from.
+
+What actually holds: the good part of the wheel is treated as **one
+contiguous arc** - 0.32 (green) round through teal, blue, violet and
+magenta to 1.0 (red) - and every harmony offset is arithmetic *inside*
+that arc, reflected at the ends rather than wrapped (wrapping would jump
+the short way across the dead zone and land in exactly the olive the arc
+exists to avoid). Every resulting hue is then safe by construction: no
+per-hue checks, no after-the-fact clamping, and nothing to get wrong when
+a new harmony is added. Harmony templates are all one-sided; the side is
+picked by the seed and only forced when the widest step wouldn't fit.
+Taking the roomier side unconditionally seems safer and isn't - it biases
+every palette towards the middle of the arc, which is violet, and two
+thirds of the seeds came out purple.
+
+Grain, last: large smooth gradients are the worst case for an 8-bit
+encoder and contour visibly without it.
+
+#### Notes on the wallhaven modes
+
+Searches are `categories=100` (general - not anime, not people) and
+`purity=100` (SFW), sorted `toplist` over `topRange=1y`, 16x9, at least
+1920x1080, against a fixed list of neutral queries.
+
+The API's own `seed` parameter is **not** used for the per-meeting mode.
+It looks like it would do the job and doesn't: the server ignores a
+client-supplied seed and substitutes one of its own (the same seed sent
+twice came back as `qUWuS9` then `gYz5ww`, with different results both
+times). Determinism is done locally instead - a hash of the meeting ID
+picks a page and an index into the stable `toplist` ordering.
+
+Caching, so this isn't hammering a free API:
+
+- Search result pages are cached for 24 hours.
+- Downloaded images are cached by wallpaper ID.
+- The resolved meeting → wallpaper ID is pinned in `seed-map.json`, so a
+  repeat of a known meeting never calls the API at all. Pinning also makes
+  "the same huddle keeps the same picture" survive the listing drifting as
+  the year's top wallpapers change.
+- Requests are serialized with a minimum gap, well inside the documented
+  45/minute.
+
+Everything lives in `~/Library/Caches/MeetCallRecorder/backgrounds/`.
+Every failure falls through to the generated gradient rather than
+returning nothing, so a recording never silently loses its background
+because wallhaven was down.
 
 ## Build & run
 
 ```sh
 Scripts/manage.sh build      # swift build -c release, package .app, sign with the local dev identity
-Scripts/manage.sh install    # build + install as a per-login LaunchAgent (RunAtLoad, no KeepAlive - respects manual Quit)
+Scripts/manage.sh install    # migrate off the old LaunchAgent, build, start
 Scripts/manage.sh update     # stop, rebuild, start - use after any code change
-Scripts/manage.sh status
+Scripts/manage.sh status     # running? login item registered?
 Scripts/manage.sh logs       # tail -f ~/Library/Logs/MeetCallRecorder.log
 Scripts/manage.sh uninstall
 ```
-
-First run needs the Screen Recording grant - open the app once from Finder
-or `open MeetCallRecorder.app` before relying on the LaunchAgent.
 
 ## Status
 
 Menu bar icon (red when recording). Menu: pause/resume detection, force
 start/stop on the frontmost window's app, open recordings folder, open
-logs, quit.
+logs, setup & permissions, settings, quit.
 
 ## Known limitations / not done yet
 

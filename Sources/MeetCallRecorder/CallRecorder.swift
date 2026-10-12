@@ -73,23 +73,23 @@ actor CallRecorder {
         writer?.status == .failed
     }
 
-    // Fixed output canvas, independent of the actual call window's size -
-    // the window is scaled (preserving aspect ratio) to fit a centered
-    // safe area, system wallpaper filling whatever's left. See
-    // FrameComposer.
-    static let outputSize = CGSize(width: 1920, height: 1080)
+    // The output canvas is fixed for the life of a call but no longer
+    // fixed for the app: it comes from the chosen RecordingQuality, read
+    // once when the call starts. The window is scaled (preserving aspect
+    // ratio) to fit a centered safe area, the call's background filling
+    // whatever's left. See FrameComposer.
+    //
+    // The constant survives only as a stand-in for code paths that need
+    // *a* size even when the call has none - audio-only finalization,
+    // which computes one and then never draws anything with it.
+    static let defaultOutputSize = CGSize(width: 1920, height: 1080)
     static let safeInset: CGFloat = 32
     static let frameRate: Int32 = 30
 
-    /// Staged segments are encoded above the rate the finished file gets,
-    /// deliberately. Everything in staging is re-encoded exactly once when
-    /// the call is assembled, and a source sitting at the target rate
-    /// loses visibly more in that pass than one with headroom. The cost is
-    /// transient: staging is deleted as soon as the assembly succeeds.
-    static let stagingBitrate = 12_000_000
-    /// The finished file is HEVC, which holds H.264-at-8Mbps quality at
-    /// roughly this rate - the point of using it over H.264 at all.
-    static let outputBitrate = 5_000_000
+    /// The quality this segment is being written at. Captured at `start`
+    /// so changing the setting mid-call can't resize the output halfway
+    /// through.
+    private(set) var quality: RecordingQuality = .p1080
 
     /// Shared hold duration for every card - opening, gap, outro. The
     /// enter/exit animation around it is `FrameComposer.cardTransitionDuration`,
@@ -105,8 +105,9 @@ actor CallRecorder {
     /// Starts a segment. What the recorder writes is the call itself and
     /// nothing else - every plate is drawn later, by RecordingAssembler,
     /// from the events logged alongside the segments.
-    func start(window: DetectedWindow, outputURL: URL) async throws -> URL {
+    func start(window: DetectedWindow, outputURL: URL, quality: RecordingQuality, background: CGImage?) async throws -> URL {
         guard !isRecording else { throw RecorderError.alreadyRecording }
+        self.quality = quality
 
         try? FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
 
@@ -136,15 +137,20 @@ actor CallRecorder {
         // keeping small; the extra moof overhead at 1080p30 is noise.
         writer.movieFragmentInterval = CMTime(seconds: 1, preferredTimescale: 1)
 
-        let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: [
-            AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: Int(Self.outputSize.width),
-            AVVideoHeightKey: Int(Self.outputSize.height),
-            AVVideoCompressionPropertiesKey: [
-                AVVideoExpectedSourceFrameRateKey: Self.frameRate,
-                AVVideoAverageBitRateKey: Self.stagingBitrate
-            ]
-        ])
+        // Audio-only skips the video input entirely rather than writing a
+        // blank track: there's no canvas, no composer, and nothing for the
+        // assembler to draw plates onto later.
+        let videoInput = quality.outputSize.map { size in
+            AVAssetWriterInput(mediaType: .video, outputSettings: [
+                AVVideoCodecKey: AVVideoCodecType.h264,
+                AVVideoWidthKey: Int(size.width),
+                AVVideoHeightKey: Int(size.height),
+                AVVideoCompressionPropertiesKey: [
+                    AVVideoExpectedSourceFrameRateKey: Self.frameRate,
+                    AVVideoAverageBitRateKey: quality.stagingBitrate
+                ]
+            ])
+        }
         let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: [
             AVFormatIDKey: kAudioFormatMPEG4AAC,
             AVSampleRateKey: 48000,
@@ -163,15 +169,21 @@ actor CallRecorder {
         // not-ready about a second in and then refused ~80% of frames, so
         // recordings froze on their first second of picture. There is no
         // non-deprecated way to express this yet.
-        videoInput.expectsMediaDataInRealTime = true
+        videoInput?.expectsMediaDataInRealTime = true
         audioInput.expectsMediaDataInRealTime = true
-        let videoReceiver = writer.inputPixelBufferReceiver(for: videoInput, pixelBufferAttributes: nil)
+        let videoReceiver = videoInput.map { writer.inputPixelBufferReceiver(for: $0, pixelBufferAttributes: nil) }
         let audioReceiver = writer.inputReceiver(for: audioInput)
 
         self.writer = writer
         self.videoReceiver = videoReceiver
         self.audioReceiver = audioReceiver
-        self.composer = FrameComposer(outputSize: Self.outputSize, safeInset: Self.safeInset)
+        self.composer = quality.outputSize.map {
+            FrameComposer(outputSize: $0, safeInset: Self.safeInset, background: background)
+        }
+        // Per segment, not per call: each segment is its own writer with
+        // its own session, and a clock carried over from the last one
+        // would report the whole call's length as this segment's.
+        audioClock.reset()
         self.isRecording = true
         self.currentOutputURL = outputURL
 
@@ -211,8 +223,17 @@ actor CallRecorder {
     /// still appends a few more seconds for the outro transition/hold, so
     /// this is deliberately read just *before* that, not after).
     var contentDuration: TimeInterval {
-        composer?.contentDuration ?? 0
+        // Audio-only writes no frames, so there is no composer and no
+        // rendered-PTS span to read. The audio path keeps its own clock
+        // for exactly this case; without it every audio-only call would
+        // report a zero-length recording and the outro/duration maths
+        // downstream would all be wrong.
+        composer?.contentDuration ?? audioClock.duration
     }
+
+    /// Tracks the span of appended audio. Only consulted for audio-only
+    /// recordings - with a picture, the composer is the authority.
+    private let audioClock = MediaClock()
 
     /// Notes a pause that happened inside the segment being written -
     /// the window went away and came back without the writer being
@@ -255,7 +276,10 @@ actor CallRecorder {
     // MARK: - Stream lifecycle
 
     private func attachStream(to window: DetectedWindow) async throws {
-        guard let writer, let videoReceiver, let audioReceiver, let composer else {
+        // Video is optional here: an audio-only segment has no receiver
+        // and no composer, and requiring them would make `start` succeed
+        // and then every attach fail.
+        guard let writer, let audioReceiver else {
             throw RecorderError.noActiveRecording
         }
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
@@ -265,8 +289,17 @@ actor CallRecorder {
 
         let filter = SCContentFilter(desktopIndependentWindow: scWindow)
         let config = SCStreamConfiguration()
-        config.width = max(2, Int(filter.contentRect.width * CGFloat(filter.pointPixelScale)))
-        config.height = max(2, Int(filter.contentRect.height * CGFloat(filter.pointPixelScale)))
+        // SCStreamConfiguration always carries a video size even when
+        // nothing consumes the frames, so an audio-only stream asks for
+        // the smallest legal one rather than paying to scale and deliver
+        // full-size buffers nobody reads.
+        if composer == nil {
+            config.width = 2
+            config.height = 2
+        } else {
+            config.width = max(2, Int(filter.contentRect.width * CGFloat(filter.pointPixelScale)))
+            config.height = max(2, Int(filter.contentRect.height * CGFloat(filter.pointPixelScale)))
+        }
         config.capturesAudio = true
         config.sampleRate = 48000
         config.channelCount = 2
@@ -292,11 +325,22 @@ actor CallRecorder {
         // and without this it would come through stretched.
         config.scalesToFit = true
 
-        let output = StreamOutput(writer: writer, videoReceiver: videoReceiver, audioReceiver: audioReceiver, composer: composer) { [weak self] error in
+        let output = StreamOutput(
+            writer: writer,
+            videoReceiver: videoReceiver,
+            audioReceiver: audioReceiver,
+            composer: composer,
+            audioClock: audioClock
+        ) { [weak self] error in
             Task { await self?.handleStreamStopped(error) }
         }
         let scStream = SCStream(filter: filter, configuration: config, delegate: output)
-        try scStream.addStreamOutput(output, type: .screen, sampleHandlerQueue: sampleQueue)
+        // No screen output at all when there's nothing to compose - SCStream
+        // would otherwise keep encoding and delivering frames for an
+        // audio-only recording to throw away.
+        if composer != nil {
+            try scStream.addStreamOutput(output, type: .screen, sampleHandlerQueue: sampleQueue)
+        }
         try scStream.addStreamOutput(output, type: .audio, sampleHandlerQueue: sampleQueue)
         try await scStream.startCapture()
 
@@ -468,9 +512,10 @@ actor CallRecorder {
 
 private final class StreamOutput: NSObject, SCStreamOutput, SCStreamDelegate {
     let writer: AVAssetWriter
-    let videoReceiver: AVAssetWriterInput.PixelBufferReceiver
+    let videoReceiver: AVAssetWriterInput.PixelBufferReceiver?
     let audioReceiver: AVAssetWriterInput.SampleBufferReceiver
-    let composer: FrameComposer
+    let composer: FrameComposer?
+    let audioClock: MediaClock
     let onStopped: @Sendable (Error) -> Void
     private var loggedWriterFailure = false
     private var loggedAudioFormat = false
@@ -496,15 +541,17 @@ private final class StreamOutput: NSObject, SCStreamOutput, SCStreamDelegate {
 
     init(
         writer: AVAssetWriter,
-        videoReceiver: AVAssetWriterInput.PixelBufferReceiver,
+        videoReceiver: AVAssetWriterInput.PixelBufferReceiver?,
         audioReceiver: AVAssetWriterInput.SampleBufferReceiver,
-        composer: FrameComposer,
+        composer: FrameComposer?,
+        audioClock: MediaClock,
         onStopped: @escaping @Sendable (Error) -> Void
     ) {
         self.writer = writer
         self.videoReceiver = videoReceiver
         self.audioReceiver = audioReceiver
         self.composer = composer
+        self.audioClock = audioClock
         self.onStopped = onStopped
     }
 
@@ -534,6 +581,10 @@ private final class StreamOutput: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         switch type {
         case .screen:
+            // Audio-only never registers a screen output, so reaching here
+            // without a composer would mean SCStream delivering a type
+            // nobody asked for.
+            guard let composer, let videoReceiver else { return }
             videoSamplesSeen += 1
             let frame: FrameComposer.Frame?
             if CMSampleBufferGetImageBuffer(sampleBuffer) != nil {
@@ -570,6 +621,7 @@ private final class StreamOutput: NSObject, SCStreamOutput, SCStreamDelegate {
             }
         case .audio:
             audioSamplesSeen += 1
+            audioClock.note(CMSampleBufferGetPresentationTimeStamp(sampleBuffer), duration: CMSampleBufferGetDuration(sampleBuffer))
             logAudioFormatOnce(sampleBuffer)
             // The receiver takes the sample as `sending`, and this one
             // isn't ours to give away - ScreenCaptureKit owns it and only
