@@ -11,9 +11,6 @@ enum BackgroundMode: String, CaseIterable, Identifiable, Sendable {
     /// was configurable, and still the default - it makes a recording
     /// read as a screenshot of a real desktop.
     case desktop
-    /// A drawn cutting-mat board: deep blue, gridded, with angle guides.
-    /// Always available, identical every time, no network.
-    case blueprint
     /// A fresh wallpaper from wallhaven.cc each call - top-rated of the
     /// past year, SFW, general category only.
     case randomPhoto
@@ -21,20 +18,70 @@ enum BackgroundMode: String, CaseIterable, Identifiable, Sendable {
     /// recurring huddle keeps the same picture across every recording of
     /// it.
     case seededPhoto
-    /// An abstract gradient generated from the meeting ID - stable per
-    /// meeting like `seededPhoto`, but drawn locally, so it never waits on
-    /// or fails over from the network.
+    /// A mesh gradient drawn on the Mac, new every call.
+    case randomGradient
+    /// The same, generated from the meeting ID - stable per meeting like
+    /// `seededPhoto`, but drawn locally, so it never waits on or fails
+    /// over from the network.
     case seededGradient
+
+    var id: String { rawValue }
+
+    /// Which of the three things a mode is, ignoring how it picks.
+    ///
+    /// The settings list is built from these rather than from the five
+    /// modes: "random photo" and "photo per meeting" are not two
+    /// different backgrounds, they're one background and a question about
+    /// it, and five flat radio buttons made the reader work that out for
+    /// themselves.
+    var family: BackgroundFamily {
+        switch self {
+        case .desktop: return .desktop
+        case .randomPhoto, .seededPhoto: return .photo
+        case .randomGradient, .seededGradient: return .gradient
+        }
+    }
+
+    /// What the picture is keyed to, or nil for the one mode that has
+    /// nothing to key.
+    var seeding: BackgroundSeeding? {
+        switch self {
+        case .desktop: return nil
+        case .randomPhoto, .randomGradient: return .perCall
+        case .seededPhoto, .seededGradient: return .perMeeting
+        }
+    }
+
+    init(family: BackgroundFamily, seeding: BackgroundSeeding) {
+        switch (family, seeding) {
+        case (.desktop, _): self = .desktop
+        case (.photo, .perCall): self = .randomPhoto
+        case (.photo, .perMeeting): self = .seededPhoto
+        case (.gradient, .perCall): self = .randomGradient
+        case (.gradient, .perMeeting): self = .seededGradient
+        }
+    }
+
+    var displayName: String { family.displayName }
+
+    /// Whether resolving it can go out to the network, and therefore
+    /// needs a cache and a fallback.
+    var usesNetwork: Bool { family == .photo }
+}
+
+/// The three kinds of background, which is what the settings list offers.
+enum BackgroundFamily: String, CaseIterable, Identifiable, Sendable {
+    case desktop
+    case photo
+    case gradient
 
     var id: String { rawValue }
 
     var displayName: String {
         switch self {
         case .desktop: return "Desktop picture"
-        case .blueprint: return "Cutting mat"
-        case .randomPhoto: return "Random photo"
-        case .seededPhoto: return "Photo per meeting"
-        case .seededGradient: return "Gradient per meeting"
+        case .photo: return "Photo"
+        case .gradient: return "Gradient"
         }
     }
 
@@ -42,21 +89,54 @@ enum BackgroundMode: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .desktop:
             return "Whatever your desktop is showing. No network, changes when your wallpaper does."
-        case .blueprint:
-            return "A drawn blue cutting mat with grid and angle guides. Same every time."
-        case .randomPhoto:
-            return "A different wallhaven.cc wallpaper each call, from the top-rated of the past year."
-        case .seededPhoto:
-            return "A wallhaven.cc wallpaper chosen from the meeting ID - the same huddle keeps the same picture."
-        case .seededGradient:
-            return "A gradient generated from the meeting ID. Stable per meeting, never touches the network."
+        case .photo:
+            return "A wallhaven.cc wallpaper - top-rated of the past year, landscapes and texture, nothing with a subject."
+        case .gradient:
+            return "A mesh gradient drawn on your Mac. Never touches the network and can't fail."
         }
     }
 
-    /// Whether resolving it can go out to the network, and therefore needs
-    /// a cache and a fallback.
-    var usesNetwork: Bool {
-        self == .randomPhoto || self == .seededPhoto
+    /// Whether the family has anything to ask about. Only the desktop
+    /// picture doesn't: it is whatever it is.
+    var isSeedable: Bool { self != .desktop }
+
+    var usesNetwork: Bool { self == .photo }
+}
+
+/// What a background is keyed to.
+enum BackgroundSeeding: String, CaseIterable, Identifiable, Sendable {
+    /// A new one for every recording, including repeats of the same
+    /// meeting.
+    case perCall
+    /// Derived from the call identifier, so a meeting keeps its own
+    /// across every recording of it.
+    case perMeeting
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .perCall: return "New each call"
+        case .perMeeting: return "Per meeting"
+        }
+    }
+
+    /// Spelled out under the picker, because the per-meeting options are
+    /// the ones where a reasonable person wonders what just got sent
+    /// where.
+    func note(for family: BackgroundFamily) -> String {
+        switch (family, self) {
+        case (.desktop, _):
+            return ""
+        case (.photo, .perCall):
+            return "A different wallpaper for every recording, picked at random and unrelated to who was on the call."
+        case (.photo, .perMeeting):
+            return "The call identifier never leaves your Mac. It's hashed here into one of nine ordinary search words, a page number and a position in the results - that's all wallhaven is asked for, and the same meeting lands on the same wallpaper every time."
+        case (.gradient, .perCall):
+            return "A different gradient for every recording, drawn from a fresh random seed."
+        case (.gradient, .perMeeting):
+            return "Drawn from a hash of the call identifier, which never leaves your Mac - nothing is sent anywhere at all. The same meeting gets the same gradient on every machine and every launch."
+        }
     }
 }
 

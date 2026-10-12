@@ -28,11 +28,13 @@ enum RecordingAssembler {
 
     /// The identifying fields stamped into the finished file's own
     /// container metadata - who recorded it, what it's a recording of,
-    /// and the two identifiers that tie it back to its source.
+    /// when it started, and the two identifiers that tie it back to its
+    /// source.
     struct RecordingMetadata {
         let sourceApp: String
         let meetingID: String
         let recordingID: String
+        let startDate: Date
     }
 
     /// One plate's position on the *output* timeline, in seconds - written
@@ -83,7 +85,7 @@ enum RecordingAssembler {
     /// and a failure partway leaves its debris with the call it belongs
     /// to, where retrying picks it up and the folder's eventual deletion
     /// takes it away.
-    static func assemble(segments: [URL], durations: [Double], inserts: [Insert], recordingID: CGImage?, metadata: RecordingMetadata, quality: RecordingQuality, background: CGImage?, scratch: URL, to destination: URL) async -> Bool {
+    static func assemble(segments: [URL], durations: [Double], inserts: [Insert], recordingID: CGImage?, metadata: RecordingMetadata, covers: CoverArt, quality: RecordingQuality, background: CGImage?, scratch: URL, to destination: URL) async -> Bool {
         guard !segments.isEmpty else { return false }
 
         // Audio-only recordings have no canvas, no plates and no video
@@ -93,11 +95,17 @@ enum RecordingAssembler {
             return await assembleAudioOnly(
                 segments: segments,
                 metadata: metadata,
+                covers: covers,
                 scratch: scratch,
                 to: destination
             )
         }
         let fm = FileManager.default
+        // Written once here rather than in each of the passes below: the
+        // mux has three fallback paths into the finished file and every
+        // one of them has to carry the same two pictures.
+        let coverFiles = writeCovers(covers, scratch: scratch)
+        defer { for file in coverFiles { try? fm.removeItem(at: file) } }
         let tempURL = scratch.appendingPathComponent(destination.lastPathComponent + ".video")
         try? fm.removeItem(at: tempURL)
 
@@ -223,37 +231,117 @@ enum RecordingAssembler {
             inserts: inserts,
             metadata: metadata,
             overlaySpans: overlaySpans,
+            coverFiles: coverFiles,
             scratch: scratch,
             destination: destination
         )
     }
 
-    /// `-metadata key=value` pairs for the identifying fields, plus the
-    /// overlay span list as one JSON string under its own key.
-    /// `use_metadata_tags` is what makes the mov/mp4 muxer keep keys it
-    /// doesn't already know about - without it, anything other than a
-    /// small fixed set (title, comment, artist, ...) is silently dropped
-    /// rather than rejected, which is what made this worth checking
-    /// against a real mux rather than assuming the flag was unnecessary.
+    /// `-metadata key=value` pairs for the finished container.
+    ///
+    /// These are the muxer's own well-known tags - title, artist, album,
+    /// date, comment - rather than the free-form keys this used to write
+    /// under `-movflags use_metadata_tags`, and the change was forced
+    /// rather than chosen. Cover art lives in the `covr` atom of the
+    /// iTunes-style tag list, and `use_metadata_tags` replaces that whole
+    /// list with a key-indexed QuickTime one: every attached cover is
+    /// dropped on the floor, silently, exactly the way unknown keys are
+    /// dropped without the flag. It is one or the other, never both -
+    /// checked against real muxes in both directions rather than assumed.
+    ///
+    /// Nothing is lost by the move. Every field that has no standard tag
+    /// of its own rides in `comment` as one JSON object, `overlays`
+    /// included, and `ffprobe -show_entries format_tags` still reads all
+    /// of it back. The standard tags are a gain on top: a player now has
+    /// a call name and a date to show instead of a filename.
     private static func containerMetadataArguments(_ metadata: RecordingMetadata, overlaySpans: [OverlaySpan]) -> [String] {
+        let start = metadata.startDate.formatted(.iso8601)
         var args = [
-            "-movflags", "use_metadata_tags",
-            "-metadata", "recorder_app=MeetCallRecorder",
-            "-metadata", "source_app=\(metadata.sourceApp)",
-            "-metadata", "meeting_id=\(metadata.meetingID)",
-            "-metadata", "recording_id=\(metadata.recordingID)"
+            "-metadata", "title=\(metadata.meetingID)",
+            "-metadata", "artist=\(metadata.sourceApp)",
+            "-metadata", "album=MeetCallRecorder",
+            "-metadata", "date=\(start)"
         ]
-        let encoder = JSONEncoder()
-        if let data = try? encoder.encode(overlaySpans), let json = String(data: data, encoding: .utf8) {
-            args.append(contentsOf: ["-metadata", "overlays=\(json)"])
+        let details = ContainerDetails(
+            sourceApp: metadata.sourceApp,
+            meetingID: metadata.meetingID,
+            recordingID: metadata.recordingID,
+            start: start,
+            overlays: overlaySpans
+        )
+        if let data = try? JSONEncoder().encode(details), let json = String(data: data, encoding: .utf8) {
+            args.append(contentsOf: ["-metadata", "comment=\(json)"])
         }
         return args
+    }
+
+    /// The identifying fields under the key names they have always had,
+    /// as one JSON object in `comment` - the slot that survives the
+    /// cover-art tag list.
+    private struct ContainerDetails: Encodable {
+        let recorderApp = "MeetCallRecorder"
+        let sourceApp: String
+        let meetingID: String
+        let recordingID: String
+        let start: String
+        let overlays: [OverlaySpan]
+
+        enum CodingKeys: String, CodingKey {
+            case recorderApp = "recorder_app"
+            case sourceApp = "source_app"
+            case meetingID = "meeting_id"
+            case recordingID = "recording_id"
+            case start
+            case overlays
+        }
+    }
+
+    // MARK: - Cover art
+
+    /// Writes the rendered covers out for ffmpeg to pick up, wide first.
+    /// Order is the order they end up in the container, and a player with
+    /// room for one picture takes the first one it finds - which for a
+    /// video file should be the 16:9 one.
+    private static func writeCovers(_ covers: CoverArt, scratch: URL) -> [URL] {
+        let runID = UUID().uuidString
+        var files: [URL] = []
+        for (index, data) in [covers.wide, covers.square].compactMap({ $0 }).enumerated() {
+            let url = scratch.appendingPathComponent(".cover-\(runID)-\(index).jpg")
+            guard (try? data.write(to: url, options: .atomic)) != nil else {
+                log("assemble: couldn't stage cover \(index)")
+                continue
+            }
+            files.append(url)
+        }
+        return files
+    }
+
+    /// The arguments that attach `files` to a mux as cover art rather
+    /// than as extra video tracks: an input each, a map each, and the
+    /// `attached_pic` disposition that turns a mapped mjpeg stream into a
+    /// `covr` entry. `inputIndex` is the first free input slot;
+    /// `videoStreams` is how many video streams the output already has,
+    /// since a disposition is addressed by output stream number.
+    private static func coverArguments(
+        _ files: [URL],
+        inputIndex: Int,
+        videoStreams: Int
+    ) -> (inputs: [String], maps: [String], dispositions: [String]) {
+        var inputs: [String] = []
+        var maps: [String] = []
+        var dispositions: [String] = []
+        for (offset, file) in files.enumerated() {
+            inputs.append(contentsOf: ["-i", file.path])
+            maps.append(contentsOf: ["-map", "\(inputIndex + offset):v:0"])
+            dispositions.append(contentsOf: ["-disposition:v:\(videoStreams + offset)", "attached_pic"])
+        }
+        return (inputs, maps, dispositions)
     }
 
     /// Builds the output's audio from the segments' own tracks plus
     /// generated silence for every stretch a plate occupies, then puts it
     /// alongside the assembled video.
-    private static func muxAudio(into video: URL, segments: [URL], durations: [Double], inserts: [Insert], metadata: RecordingMetadata, overlaySpans: [OverlaySpan], scratch scratchDir: URL, destination: URL) async -> Bool {
+    private static func muxAudio(into video: URL, segments: [URL], durations: [Double], inserts: [Insert], metadata: RecordingMetadata, overlaySpans: [OverlaySpan], coverFiles: [URL], scratch scratchDir: URL, destination: URL) async -> Bool {
         let metadataArgs = containerMetadataArguments(metadata, overlaySpans: overlaySpans)
         let fm = FileManager.default
         let runID = UUID().uuidString
@@ -313,13 +401,13 @@ enum RecordingAssembler {
 
         guard !pieces.isEmpty else {
             // No audio anywhere - the video alone is the recording.
-            return await stampAndMove(video, metadataArgs: metadataArgs, scratch: scratchDir, to: destination)
+            return await stampAndMove(video, metadataArgs: metadataArgs, coverFiles: coverFiles, scratch: scratchDir, to: destination)
         }
 
         let listFile = scratchDir.appendingPathComponent(".audio-\(runID).txt")
         let list = pieces.map { "file '\($0.path.replacingOccurrences(of: "'", with: "'\\''"))'" }.joined(separator: "\n") + "\n"
         guard (try? list.write(to: listFile, atomically: true, encoding: .utf8)) != nil else {
-            return await stampAndMove(video, metadataArgs: metadataArgs, scratch: scratchDir, to: destination)
+            return await stampAndMove(video, metadataArgs: metadataArgs, coverFiles: coverFiles, scratch: scratchDir, to: destination)
         }
         scratch.append(listFile)
 
@@ -329,7 +417,7 @@ enum RecordingAssembler {
             "-c", "copy", "-f", "mp4", audioURL.path
         ]), fm.fileExists(atPath: audioURL.path) else {
             log("assemble: audio concat failed - keeping the video alone")
-            return await stampAndMove(video, metadataArgs: metadataArgs, scratch: scratchDir, to: destination)
+            return await stampAndMove(video, metadataArgs: metadataArgs, coverFiles: coverFiles, scratch: scratchDir, to: destination)
         }
         scratch.append(audioURL)
 
@@ -337,13 +425,18 @@ enum RecordingAssembler {
         // separate remux - it's already rewriting the container to add
         // the audio track, so there's no second pass to add here.
         let muxed = scratchDir.appendingPathComponent(destination.lastPathComponent + ".assembling")
+        // The covers are inputs 2 and up, and land after the picture
+        // track, which is the output's only video stream before them.
+        let cover = coverArguments(coverFiles, inputIndex: 2, videoStreams: 1)
         guard await CrashRecovery.runFFmpegArgs([
-            "-y", "-i", video.path, "-i", audioURL.path,
-            "-map", "0:v:0", "-map", "1:a:0", "-c", "copy"
-        ] + metadataArgs + ["-f", "mp4", muxed.path]), fm.fileExists(atPath: muxed.path) else {
+            "-y", "-i", video.path, "-i", audioURL.path
+        ] + cover.inputs + [
+            "-map", "0:v:0", "-map", "1:a:0"
+        ] + cover.maps + ["-c", "copy"] + cover.dispositions
+            + metadataArgs + ["-f", "mp4", muxed.path]), fm.fileExists(atPath: muxed.path) else {
             log("assemble: mux failed - keeping the video alone")
             try? fm.removeItem(at: muxed)
-            return await stampAndMove(video, metadataArgs: metadataArgs, scratch: scratchDir, to: destination)
+            return await stampAndMove(video, metadataArgs: metadataArgs, coverFiles: coverFiles, scratch: scratchDir, to: destination)
         }
         return move(muxed, to: destination)
     }
@@ -354,11 +447,16 @@ enum RecordingAssembler {
     /// in. Falls back to moving `source` as-is if the remux itself fails,
     /// since losing the metadata is far preferable to losing the
     /// recording.
-    private static func stampAndMove(_ source: URL, metadataArgs: [String], scratch scratchDir: URL, to destination: URL) async -> Bool {
+    private static func stampAndMove(_ source: URL, metadataArgs: [String], coverFiles: [URL], scratch scratchDir: URL, to destination: URL) async -> Bool {
         let stamped = scratchDir.appendingPathComponent(destination.lastPathComponent + ".stamping")
         defer { try? FileManager.default.removeItem(at: stamped) }
+        // `-map 0` where the pass used to map nothing at all: naming the
+        // covers' streams means naming the source's too, and the source
+        // here is always the video-only file the writer produced.
+        let cover = coverArguments(coverFiles, inputIndex: 1, videoStreams: 1)
         guard await CrashRecovery.runFFmpegArgs(
-            ["-y", "-i", source.path, "-c", "copy"] + metadataArgs + ["-f", "mp4", stamped.path]
+            ["-y", "-i", source.path] + cover.inputs + ["-map", "0"] + cover.maps
+                + ["-c", "copy"] + cover.dispositions + metadataArgs + ["-f", "mp4", stamped.path]
         ), FileManager.default.fileExists(atPath: stamped.path) else {
             log("assemble: metadata stamp failed - keeping the file as-is")
             return move(source, to: destination)
@@ -390,11 +488,18 @@ enum RecordingAssembler {
     /// just two pieces of audio meeting. So this is a stream-copy concat
     /// and a metadata stamp, which is also why it finishes in well under a
     /// second where the video path takes tens of them.
-    private static func assembleAudioOnly(segments: [URL], metadata: RecordingMetadata, scratch: URL, to destination: URL) async -> Bool {
+    private static func assembleAudioOnly(segments: [URL], metadata: RecordingMetadata, covers: CoverArt, scratch: URL, to destination: URL) async -> Bool {
         let fm = FileManager.default
         let runID = UUID().uuidString
         var temporary: [URL] = []
         defer { for file in temporary { try? fm.removeItem(at: file) } }
+
+        // Only the square cover: an `.m4a` is shown as an album tile
+        // everywhere it is shown at all, and there is no 16:9 slot
+        // anywhere in an audio player for the wide one to fill. The
+        // renderer knows this too and doesn't draw it.
+        let coverFiles = writeCovers(CoverArt(wide: nil, square: covers.square), scratch: scratch)
+        temporary.append(contentsOf: coverFiles)
 
         // Staged segments are QuickTime containers holding an AAC track.
         // Each is re-wrapped as MP4 before the concat demuxer sees it:
@@ -426,9 +531,13 @@ enum RecordingAssembler {
 
         let assembled = scratch.appendingPathComponent(destination.lastPathComponent + ".assembling")
         try? fm.removeItem(at: assembled)
+        // The cover is the output's first and only video stream here,
+        // which is what `videoStreams: 0` says.
+        let cover = coverArguments(coverFiles, inputIndex: 1, videoStreams: 0)
         guard await CrashRecovery.runFFmpegArgs([
-            "-y", "-f", "concat", "-safe", "0", "-i", listFile.path, "-c", "copy"
-        ] + containerMetadataArguments(metadata, overlaySpans: []) + ["-f", "mp4", assembled.path]),
+            "-y", "-f", "concat", "-safe", "0", "-i", listFile.path
+        ] + cover.inputs + ["-map", "0:a:0"] + cover.maps + ["-c", "copy"] + cover.dispositions
+            + containerMetadataArguments(metadata, overlaySpans: []) + ["-f", "mp4", assembled.path]),
             fm.fileExists(atPath: assembled.path) else {
             log("assemble: audio concat failed")
             try? fm.removeItem(at: assembled)

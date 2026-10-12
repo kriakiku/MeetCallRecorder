@@ -68,6 +68,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Before anything can hand us a grant mid-session - that's the
         // distinction the welcome screen's restart prompt rests on.
         PermissionCoordinator.captureLaunchState()
+        // Warms the source icons so the settings window has them the first
+        // time it's opened, and so a call's overlay can be stamped with the
+        // app's icon even if the app isn't running when recovery finds it.
+        AppIcons.shared.refresh()
         setupStatusItem()
         log("MeetCallRecorder starting")
         // There's no read-only CLI for a login item's registration state,
@@ -571,7 +575,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             metadata: RecordingAssembler.RecordingMetadata(
                 sourceApp: call.ownerName,
                 meetingID: call.callID,
-                recordingID: call.recordingID
+                recordingID: call.recordingID,
+                startDate: call.startDate
+            ),
+            // Rendered here rather than in the assembler for the same
+            // reason the plates are: this is the main actor, and the
+            // artwork is AppKit text and icon drawing.
+            covers: CoverArtRenderer.render(
+                appIcon: call.icon,
+                appName: call.ownerName,
+                callID: call.callID,
+                startDate: call.startDate,
+                meetingDuration: meetingDuration,
+                includeWide: !call.quality.isAudioOnly
             ),
             quality: call.quality,
             background: call.background,
@@ -639,7 +655,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 recordingID: stale.recordingID,
                 quality: stale.quality,
                 background: background,
-                icon: Self.icon(forAppNamed: stale.ownerName),
+                icon: AppIcons.shared.icon(forAppNamed: stale.ownerName),
                 closedDuration: stale.closedDuration,
                 missingSince: CrashRecovery.lastWrite(in: stale.folder)
             )
@@ -715,10 +731,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         name.components(separatedBy: CharacterSet(charactersIn: "/:"))
             .joined(separator: "-")
             .trimmingCharacters(in: .whitespaces)
-    }
-
-    private static func icon(forAppNamed name: String) -> NSImage? {
-        NSWorkspace.shared.runningApplications.first { $0.localizedName == name }?.icon
     }
 
     // MARK: - Logging

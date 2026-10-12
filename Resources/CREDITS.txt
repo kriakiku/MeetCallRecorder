@@ -1,0 +1,113 @@
+MeetCallRecorder - image sources
+================================
+
+Everything this app puts on screen is either drawn by it or listed below.
+
+
+Sample wallpapers
+-----------------
+
+Eight wallpapers ship inside the app. They are used in exactly one
+place: the background preview in Settings > Background. They stand in
+for the two photo modes so that opening the settings window never has
+to download anything, and so the preview looks the same with the
+network down. They are never used in a recording - a real call gets a
+wallpaper fetched live (see below) or a background the app draws
+itself.
+
+All eight came from wallhaven.cc, out of the same pool the app itself
+searches: general category, SFW. Each was cropped to 16:9, scaled to
+640x360 - the size the preview actually draws them at - and re-encoded
+as WebP at quality 35. The whole set is about 140 KB; the individual
+files run 10-31 KB against originals of 0.4-4.3 MB. Follow the links
+for the full-size files and for whatever terms the uploader attached
+to them.
+
+Four of them stand in for "Photo per meeting", one per sample meeting:
+
+  Resources/Backgrounds/sample-4xl39z.webp
+    Vilnius old town seen from Gediminas Hill.
+    https://wallhaven.cc/w/4xl39z   uploaded by Logome
+
+  Resources/Backgrounds/sample-jel1jq.webp
+    "Robot Dave" - a workshop interior at night.
+    https://wallhaven.cc/w/jel1jq   uploaded by jrmnt
+    Artwork: https://www.behance.net/gallery/234186439/Robot-Dave
+
+  Resources/Backgrounds/sample-2168qx.webp
+    Ears of wheat in close-up.
+    https://wallhaven.cc/w/2168qx   uploaded by jjmax
+
+  Resources/Backgrounds/sample-7jx91o.webp
+    A bus on a country road under cooling towers.
+    https://wallhaven.cc/w/7jx91o   uploaded by Artix
+    Artwork: https://www.simonstalenhag.se/
+
+The other four stand in for "Random photo". They are a separate set so
+that no two cards in the preview ever show the same picture:
+
+  Resources/Backgrounds/sample-4dj973.webp
+    An electric locomotive on a freight line.
+    https://wallhaven.cc/w/4dj973   uploaded by MeowSide
+
+  Resources/Backgrounds/sample-pomo69.webp
+    "Evening lights" - a hillside above a city at dusk.
+    https://wallhaven.cc/w/pomo69   uploaded by thedrexter
+    Artwork: https://www.newgrounds.com/art/view/kldpxl/evening-lights
+
+  Resources/Backgrounds/sample-og7g27.webp
+    An empty side street at dawn.
+    https://wallhaven.cc/w/og7g27   uploaded by mu51
+
+  Resources/Backgrounds/sample-5yp5q3.webp
+    A seafront terrace with wind turbines.
+    https://wallhaven.cc/w/5yp5q3   uploaded by jrmnt
+    Artist: https://x.com/no3smokingroom
+
+
+Wallpapers downloaded while running
+-----------------------------------
+
+The "Random photo" and "Photo per meeting" background modes fetch a
+wallpaper from the wallhaven.cc API when a call starts, and cache it
+under ~/Library/Caches/MeetCallRecorder/backgrounds. Searches are
+restricted to the general category at SFW purity, 16:9 and at least
+1920x1080, sorted by the past year's toplist.
+
+  API:   https://wallhaven.cc/help/api
+  Terms: https://wallhaven.cc/terms
+
+Those images belong to their respective uploaders and are not
+redistributed by this app - they live in a local cache on the machine
+that downloaded them, and end up only in that machine's own
+recordings.
+
+
+Code
+----
+
+  DynamicColor - https://github.com/yannickl/DynamicColor
+    MIT licence, (c) Yannick Loriot. Colour manipulation used by the
+    "Gradient per meeting" background: harmonies, tints and shades, and
+    palette interpolation in Cie L*a*b*, which is what keeps the midpoint
+    between two distant hues a colour instead of grey.
+
+
+Everything else
+---------------
+
+  Gradients, title cards, the welcome screen's mark
+    Drawn at runtime by the app (BackgroundArtwork, TitleCardRenderer,
+    WelcomeIconMark). No third-party artwork; the gradient's colour
+    maths uses DynamicColor, above.
+
+  Desktop picture background
+    Whatever the Mac's own desktop picture is at the time.
+
+  Google Meet and Slack icons
+    Read off the installed applications on this Mac at launch, never
+    bundled - see AppIcons. They belong to Google and Slack
+    respectively and are shown only to label their own rows.
+
+  Everything else in the interface
+    SF Symbols, from macOS.

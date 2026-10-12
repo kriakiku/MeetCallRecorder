@@ -34,6 +34,12 @@ build() {
   mkdir -p "${APP_BUNDLE}/Contents/MacOS"
   cp "${REPO_DIR}/.build/release/${APP_NAME}" "${APP_BUNDLE}/Contents/MacOS/"
   cp "${SCRIPT_DIR}/Info.plist" "${APP_BUNDLE}/Contents/Info.plist"
+  # Copied by hand rather than declared in Package.swift: SwiftPM would
+  # put them in a MeetCallRecorder_MeetCallRecorder.bundle next to the
+  # executable, which is not where Bundle.main looks. Contents/Resources
+  # is, and this bundle is assembled here anyway.
+  mkdir -p "${APP_BUNDLE}/Contents/Resources"
+  cp -R "${REPO_DIR}/Resources/." "${APP_BUNDLE}/Contents/Resources/"
   codesign --force --deep -s "$SIGNING_IDENTITY" "$APP_BUNDLE"
   echo "==> Built: ${APP_BUNDLE}"
 }

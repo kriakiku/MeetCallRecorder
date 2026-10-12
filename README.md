@@ -85,17 +85,32 @@ the whole screen or system audio. Finished recordings are left in
   it, and the software VP9 encode took minutes per call where HEVC is the
   same hardware-encoder pass the assembler already does, with every ffmpeg
   pass after it a stream copy.
-- **Container metadata**: the finished file carries `recorder_app`,
-  `source_app`, `meeting_id` and `recording_id` as plain QuickTime/MP4
-  metadata tags, plus `overlays` - a JSON array of every welcome/pause/
-  resize/closing plate's `{type, start, end}` on the *output* timeline, in
-  seconds, for cutting them out later without having to re-detect them
-  from the picture. All of it goes through `ffprobe -show_entries
-  format_tags`. Needs `-movflags use_metadata_tags` on every ffmpeg pass
-  that touches the file: without it, the mov/mp4 muxer keeps a small fixed
-  set of well-known keys (title, comment, artist, ...) and silently drops
-  anything else, which only showed up by checking a real mux rather than
-  assuming the flag was unnecessary.
+- **Container metadata**: the finished file carries the call's name as
+  `title`, its source app as `artist`, `MeetCallRecorder` as `album` and
+  the start as `date`, plus a `comment` holding one JSON object with
+  `recorder_app`, `source_app`, `meeting_id`, `recording_id`, `start` and
+  `overlays` - a JSON array of every welcome/pause/resize/closing plate's
+  `{type, start, end}` on the *output* timeline, in seconds, for cutting
+  them out later without having to re-detect them from the picture. All of
+  it goes through `ffprobe -show_entries format_tags`.
+- **Metadata and cover art are the same tag list, so they compete.** The
+  identifying fields used to be free-form keys written under `-movflags
+  use_metadata_tags`, which is what makes the mov/mp4 muxer keep keys it
+  doesn't know about. But cover art lives in the `covr` atom of the
+  iTunes-style tag list, and that flag replaces the whole list with a
+  key-indexed QuickTime one - every attached cover is dropped, silently,
+  exactly the way unknown keys are dropped without the flag. It is one or
+  the other, never both; both directions were checked against a real mux
+  rather than assumed. The covers won, and nothing was lost: every field
+  without a standard tag of its own moved into the `comment` JSON, and
+  players that used to show a filename now show the call and its date.
+- **Two covers are embedded**: the welcome screen's own look - dark field,
+  gradient bloom, glowing mark - carrying the call's icon, name, date and
+  how long the meeting ran, with the app's mark small and half-opaque in
+  the corner. One 16:9 at 1024x576 for the video, one square at 720x720
+  for the audio tile, both JPEG at 0.72 and together under 100 KB: this is
+  a thumbnail in a player's sidebar riding inside an otherwise lean file,
+  not something anyone looks at full-size.
 - **The closing plate reports the meeting's own span, not the footage
   total.** A sum of segment durations skips straight over every pause -
   nothing was captured during one - but the time still passed, so it's
@@ -182,7 +197,9 @@ entirely: no canvas, no composer, no screen output registered on the
 SCStream, and no plates at assembly. Plates exist to cover a gap in the
 *picture*; without one, a pause is just two pieces of audio meeting. That
 path is a stream-copy concat and a metadata stamp, so it finishes in well
-under a second where the video path takes tens of them.
+under a second where the video path takes tens of them. It carries the
+square cover alone - there is no 16:9 slot anywhere in an audio player for
+the wide one to fill, and the renderer knows not to draw it.
 
 The quality a call was captured at is written into its staging meta, so a
 call recovered after a crash is assembled onto the canvas its segments
@@ -206,57 +223,98 @@ period instead of being stranded in staging.
 What fills the margin around the scaled call window.
 
 1. **Desktop picture** - the default; what the app always did.
-2. **Cutting mat** - a drawn blue board with grid, angle guides and edge
-   ticks. No network, identical every time.
-3. **Random photo** - a different wallhaven.cc wallpaper each call.
-4. **Photo per meeting** - the same source, picked from a hash of the
-   meeting ID, so one recurring huddle keeps its picture.
-5. **Gradient per meeting** - an abstract gradient generated from the
-   meeting ID. Stable per meeting, never touches the network.
+2. **Photo** - a wallhaven.cc wallpaper.
+3. **Gradient** - a mesh gradient drawn on the Mac.
+
+Photo and gradient each answer one further question, **new each call** or
+**per meeting**, which is the same question both times: whether the
+backdrop is picked fresh or derived from the call identifier. The
+settings list is built from the three families rather than from the five
+modes they expand into - "random photo" and "photo per meeting" are not
+two different backgrounds, they are one background and a question about
+it.
+
+Per meeting never sends the identifier anywhere. For the gradient
+nothing leaves the Mac at all; for the photo the identifier is hashed
+locally into one of nine ordinary search words, a page number and a
+position in the results, and that is all wallhaven is asked for.
 
 Resolved once per call before the first segment opens, and awaited - the
 composer runs in the sample path, where nothing can wait on a download.
 
-#### Notes on the two generated ones
+The tab previews the choice on four cards dealt into each other: four
+sample meetings, two Meet codes and two Slack huddle titles. Two cards
+from the same app sitting side by side with different backdrops is what
+says the picture follows the meeting rather than the application - and a
+fixed mode, which gives all four the same backdrop, is just as visible.
+The preview is pinned while the mode list scrolls under it, and hovering
+a card lifts it clear of the ones dealt on top of it.
 
-The gradient is **bezier ribbons**, not stacked radial gradients. A radial
-gradient's boundary is a circle, so stacking them can only ever produce
-concentric haze; the mesh-gradient look it's chasing is colour regions
-meeting along *curves*. Each ribbon is a very wide cubic bezier stroke
-that enters and leaves off-canvas (so no round cap is ever visible in
-frame), drawn opaque, and then blurred at ~8.5% of the canvas height -
-at that radius a stroke edge stops being an edge and becomes the
-transition between two colour fields. The first ribbon is deliberately
-the widest and routed through the middle, because without that guarantee
-some seeds put every curve out past a corner and left the canvas as bare
-base gradient.
+The two photo modes stand in eight bundled wallpapers - four each, so no
+card ever repeats its neighbour - rather than downloading four per tab
+visit. They ship at 640x360 in WebP, which is the size the preview draws
+them at, for about 140 KB in total. They never reach a recording, and
+`Resources/CREDITS.txt` says where they came from (About › Credits opens
+it in the app).
 
-Hue is the part that took three goes. Clamping everything within ±40° of a
-base and blending additively over a near-black floor gave a flat
-single-colour wash - the base hue won every time. Opening the spread up
-put half the seeds in the amber/yellow-green band, which is brown and
-olive at the brightnesses a background behind a call window has to sit at.
-The fix after that - giving each hue arc a permitted *direction* to walk -
-could not work either, and it's worth saying why: some harmony templates
-contained both signs (`[0, 0.11, -0.08]`), so they walked both ways
-regardless of what the direction said, which is where the chartreuse rings
-and brown smears came from.
+#### Notes on the generated one
 
-What actually holds: the good part of the wheel is treated as **one
-contiguous arc** - 0.32 (green) round through teal, blue, violet and
-magenta to 1.0 (red) - and every harmony offset is arithmetic *inside*
-that arc, reflected at the ends rather than wrapped (wrapping would jump
-the short way across the dead zone and land in exactly the olive the arc
-exists to avoid). Every resulting hue is then safe by construction: no
-per-hue checks, no after-the-fact clamping, and nothing to get wrong when
-a new harmony is added. Harmony templates are all one-sided; the side is
-picked by the seed and only forced when the widest step wouldn't fit.
-Taking the roomier side unconditionally seems safer and isn't - it biases
-every palette towards the middle of the arc, which is violet, and two
-thirds of the seeds came out purple.
+The gradient is a SwiftUI **`MeshGradient`**, 4x4, rasterized through
+`ImageRenderer` - which is why resolving it is main-actor work and the
+library hops over for it. Three control points a side gives one free
+interior point, which is a diagonal wash; five gives bands narrow enough
+to read as stripes. Four has four free interior points, enough for colour
+regions to meet along curves. Edge points may slide along their edge but
+never off it: a control point outside the unit square drags the patch
+with it and leaves the canvas corner filled by extrapolation.
 
-Grain, last: large smooth gradients are the worst case for an 8-bit
-encoder and contour visibly without it.
+Colours are laid out **radially around a seeded light**, not as a ramp.
+The first version ran the palette along the `row + col` diagonal and it
+was the wrong shape - a monotone ramp interpolated smoothly is a wash,
+and nothing in it said where the picture was lit from. Now hue walks
+outward from the light along the harmony, brightness falls away from it,
+and the far corners shade hardest, which also puts the darkest parts
+where the call window goes. The per-node falloff carries a little noise:
+without it the four nodes of an edge row are near-equidistant from the
+light, land on the same colour, and the bottom of the frame reads as a
+straight band.
+
+**Mud** is the failure mode this has always been fighting, and the fix is
+now structural rather than a trick. Mud comes from averaging distant hues:
+in sRGB the midpoint of two opposites is grey, and a mesh gradient is
+nothing *but* midpoints. So the harmony ramp is built with
+[DynamicColor](https://github.com/yannickl/DynamicColor) in Cie L\*a\*b\*,
+where that midpoint is still a colour, and the mesh itself interpolates in
+`.perceptual` space for the same reason. The version before this avoided
+averaging altogether - opaque blurred bezier ribbons composited with
+`plusLighter` so overlaps climbed towards white - which worked and looked
+like blurred ribbons.
+
+Hue still comes off a **contiguous safe arc**: 0.32 (green) round through
+teal, blue, violet and magenta to 1.0 (red), with all harmony arithmetic
+done *inside* the arc and reflected at its ends. The ~0.08-0.30 gap it
+leaves out, amber through yellow-green, is brown and olive at the
+brightnesses a background behind a call window sits at. This is also why
+the harmony isn't built with DynamicColor's `adjustedHue`, which walks the
+whole wheel and would step straight into it. Harmony templates are all
+one-sided; an earlier version had mixed-sign templates (`[0, 0.11,
+-0.08]`) and tried to contain them by giving each hue arc a permitted
+direction, which cannot work - a template containing both signs walks both
+ways whatever the direction says, and that is where the chartreuse rings
+and brown smears came from. The side is picked by the seed and only forced
+when the template wouldn't fit that way; taking the roomier side
+unconditionally sounds safer and isn't, because it biases every palette
+towards the middle of the arc, which is violet.
+
+There is **no grain**. The ribbon version carried a faint noise pass to
+dither away the banding an 8-bit encoder puts into a large smooth
+gradient, and a stronger version of it was tried here as a look. It was
+dropped on a measurement: 30 seconds of a static 1080p gradient encodes
+to 4.1 MB clean and 10.1 MB with grain. Static noise is not free the way
+it intuitively should be - the frames are identical, so inter-frame
+prediction does code the margin as skip, but every keyframe pays for the
+noise in full, and at a keyframe every couple of seconds that is most of
+a recording's budget.
 
 #### Notes on the wallhaven modes
 

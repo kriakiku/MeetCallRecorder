@@ -1,188 +1,64 @@
 import AppKit
 import CoreGraphics
-import CoreImage
+import DynamicColor
+import SwiftUI
 
-/// The two backgrounds the app draws itself: the cutting mat and the
-/// per-meeting gradient. Neither touches the network, so both double as
-/// the fallback when a photo can't be fetched.
+/// The background the app draws itself: the per-meeting gradient. It
+/// touches no network, so it doubles as the fallback when a photo can't
+/// be fetched.
 enum BackgroundArtwork {
-
-    // MARK: - Cutting mat
-
-    /// A self-healing cutting mat: deep blue board, white grid, angle
-    /// guides at the corners, edge ticks.
-    ///
-    /// Everything is sized off the canvas height rather than fixed pixels,
-    /// so 720p and 1440p get the same board at different resolutions
-    /// instead of a differently-proportioned one.
-    static func cuttingMat(size: CGSize) -> CGImage? {
-        guard let context = makeContext(size: size) else { return nil }
-
-        // Not flat: a real mat picks up a sheen from above, and a plain
-        // fill reads as a coloured rectangle rather than as plastic.
-        drawLinearGradient(
-            in: context,
-            size: size,
-            colors: [
-                CGColor(red: 0.078, green: 0.247, blue: 0.369, alpha: 1),
-                CGColor(red: 0.047, green: 0.161, blue: 0.251, alpha: 1),
-                CGColor(red: 0.031, green: 0.110, blue: 0.180, alpha: 1)
-            ],
-            locations: [0, 0.55, 1]
-        )
-
-        // One "inch" is a twelfth of the height, which keeps the familiar
-        // mat proportions on any canvas: roughly 21 x 12 cells at 16:9.
-        let unit = size.height / 12
-        let margin = unit * 0.6
-
-        context.setLineCap(.butt)
-
-        // Minor grid first, then major over it - drawing the bright lines
-        // last keeps the intersections crisp rather than letting the
-        // half-alpha minor lines wash over them.
-        strokeGrid(
-            context, size: size, margin: margin, spacing: unit / 2,
-            color: CGColor(red: 1, green: 1, blue: 1, alpha: 0.095),
-            lineWidth: max(0.5, unit * 0.006)
-        )
-        strokeGrid(
-            context, size: size, margin: margin, spacing: unit,
-            color: CGColor(red: 1, green: 1, blue: 1, alpha: 0.26),
-            lineWidth: max(0.8, unit * 0.011)
-        )
-
-        drawBorder(context, size: size, margin: margin, unit: unit)
-        drawAngleGuides(context, size: size, margin: margin, unit: unit)
-        drawEdgeTicks(context, size: size, margin: margin, unit: unit)
-
-        guard let flat = context.makeImage() else { return nil }
-        // A touch of grain breaks up the large flat areas, which otherwise
-        // band badly once the encoder gets to them.
-        return addGrain(to: flat, size: size, intensity: 0.022) ?? flat
-    }
-
-    /// The outer cut border - a brighter double rule, the way a mat's
-    /// printed edge reads.
-    private static func drawBorder(_ context: CGContext, size: CGSize, margin: CGFloat, unit: CGFloat) {
-        let outer = CGRect(x: margin, y: margin, width: size.width - margin * 2, height: size.height - margin * 2)
-        context.setStrokeColor(CGColor(red: 1, green: 1, blue: 1, alpha: 0.34))
-        context.setLineWidth(max(1, unit * 0.016))
-        context.stroke(outer)
-
-        let inset = unit * 0.16
-        context.setStrokeColor(CGColor(red: 1, green: 1, blue: 1, alpha: 0.14))
-        context.setLineWidth(max(0.6, unit * 0.008))
-        context.stroke(outer.insetBy(dx: inset, dy: inset))
-    }
-
-    /// The 30/45/60° guides a mat carries in its corners for mitre cuts.
-    private static func drawAngleGuides(_ context: CGContext, size: CGSize, margin: CGFloat, unit: CGFloat) {
-        let length = unit * 3.4
-        context.setLineWidth(max(0.7, unit * 0.009))
-        context.setStrokeColor(CGColor(red: 1, green: 1, blue: 1, alpha: 0.22))
-
-        // Mirrored into all four corners by flipping the direction each
-        // ray travels, so one set of angles describes the whole board.
-        let corners: [(CGPoint, CGFloat, CGFloat)] = [
-            (CGPoint(x: margin, y: margin), 1, 1),
-            (CGPoint(x: size.width - margin, y: margin), -1, 1),
-            (CGPoint(x: margin, y: size.height - margin), 1, -1),
-            (CGPoint(x: size.width - margin, y: size.height - margin), -1, -1)
-        ]
-        for (origin, sx, sy) in corners {
-            for degrees in [30.0, 45.0, 60.0] {
-                let radians = degrees * .pi / 180
-                context.move(to: origin)
-                context.addLine(to: CGPoint(
-                    x: origin.x + cos(radians) * length * sx,
-                    y: origin.y + sin(radians) * length * sy
-                ))
-            }
-        }
-        context.strokePath()
-    }
-
-    /// Ruler ticks just inside the border, longer every whole unit.
-    private static func drawEdgeTicks(_ context: CGContext, size: CGSize, margin: CGFloat, unit: CGFloat) {
-        context.setLineWidth(max(0.7, unit * 0.010))
-        context.setStrokeColor(CGColor(red: 1, green: 1, blue: 1, alpha: 0.30))
-
-        let step = unit / 4
-        var x = margin + step
-        var index = 1
-        while x < size.width - margin {
-            let length = index % 4 == 0 ? unit * 0.26 : unit * 0.13
-            context.move(to: CGPoint(x: x, y: margin))
-            context.addLine(to: CGPoint(x: x, y: margin + length))
-            context.move(to: CGPoint(x: x, y: size.height - margin))
-            context.addLine(to: CGPoint(x: x, y: size.height - margin - length))
-            x += step
-            index += 1
-        }
-
-        var y = margin + step
-        index = 1
-        while y < size.height - margin {
-            let length = index % 4 == 0 ? unit * 0.26 : unit * 0.13
-            context.move(to: CGPoint(x: margin, y: y))
-            context.addLine(to: CGPoint(x: margin + length, y: y))
-            context.move(to: CGPoint(x: size.width - margin, y: y))
-            context.addLine(to: CGPoint(x: size.width - margin - length, y: y))
-            y += step
-            index += 1
-        }
-        context.strokePath()
-    }
-
-    private static func strokeGrid(_ context: CGContext, size: CGSize, margin: CGFloat, spacing: CGFloat, color: CGColor, lineWidth: CGFloat) {
-        context.setStrokeColor(color)
-        context.setLineWidth(lineWidth)
-        var x = margin
-        while x <= size.width - margin + 0.5 {
-            context.move(to: CGPoint(x: x, y: margin))
-            context.addLine(to: CGPoint(x: x, y: size.height - margin))
-            x += spacing
-        }
-        var y = margin
-        while y <= size.height - margin + 0.5 {
-            context.move(to: CGPoint(x: margin, y: y))
-            context.addLine(to: CGPoint(x: size.width - margin, y: y))
-            y += spacing
-        }
-        context.strokePath()
-    }
 
     // MARK: - Seeded gradient
 
-    /// An abstract gradient derived from `seed`.
+    /// A 4x4 mesh. Three gives one free interior point, which is a
+    /// diagonal wash and not much else; five starts producing bands
+    /// narrow enough to read as stripes at the size a background is
+    /// actually seen. Four has four free interior points, which is enough
+    /// for colour regions to meet along curves - the thing that makes a
+    /// mesh gradient look like one.
+    private static let meshSide = 4
+
+    /// How far an interior control point may wander from its place on the
+    /// regular grid, as a fraction of the canvas.
     ///
-    /// The brief was "beautiful, no mud, no strange transitions". Mud
-    /// comes from *averaging* distant hues - the midpoint of two opposites
-    /// in sRGB is grey - so the defence isn't to keep every hue close
-    /// together (that just gives a flat, one-colour wash; the first
-    /// version did exactly that and looked like a green sheet of paper).
-    /// It's to never average at all: the lights are composited with
-    /// `plusLighter` over a dark base, so where two of them overlap the
-    /// result climbs towards white rather than sinking towards grey. That
-    /// makes wider, more interesting spreads safe, so hue offsets come
-    /// from a small set of hand-picked harmonies instead of one clamp.
+    /// A third of the cell spacing. Past that, neighbouring points start
+    /// crossing over each other and the patch folds back on itself, which
+    /// shows up as a hard crease - the one genuinely ugly failure mode
+    /// this has.
+    private static let meshJitter = 0.14
+
+    /// How many canvas pixels across one grain of noise is.
+    private static let grainScale = 1.6
+
+    /// How far the grain swings either side of neutral. High, and
+    /// affordable - see `addGrain` for why a static background makes
+    /// this nearly free in the encoder.
+    private static let grainIntensity = 0.34
+
     /// Hue offsets from the base, in turns, always non-negative.
     ///
     /// Wider than they look safe, deliberately. The references this is
     /// chasing get their punch from two genuinely different colours
-    /// meeting - pink against cyan, orange against blue - and a ±40°
-    /// spread can't do that. What makes the wide ones safe is that the
-    /// ribbons are drawn *opaque*: only the blur mixes them, and only in a
-    /// band at the boundary.
+    /// meeting - pink against cyan, orange against blue - and a +/-40
+    /// degree spread can't do that.
+    ///
+    /// What makes the wide ones safe here is the interpolation: the ramp
+    /// between harmony colours is built in Cie L*a*b*, where the midpoint
+    /// of two distant hues is still a colour. In sRGB it is grey, and
+    /// that grey was the "mud" every earlier version of this was fighting
+    /// - the one before this avoided averaging altogether, compositing
+    /// opaque blurred ribbons with `plusLighter` so that overlaps climbed
+    /// towards white instead. A mesh gradient has no such escape: it
+    /// averages everywhere, by definition. Moving the averaging into a
+    /// perceptual space is what makes it safe to do.
     ///
     /// All one-sided on purpose. An earlier version had mixed-sign
     /// templates (`[0, 0.11, -0.08]`) and tried to keep them out of the
     /// dead zone by giving each hue arc a permitted direction - which
     /// cannot work, because a template containing both signs walks both
     /// ways whatever the direction says. That's what put chartreuse rings
-    /// and brown smears in the output. Here the sign is the caller's to
-    /// choose and applies to the whole template at once.
+    /// and brown smears in the output. Here the sign is chosen once and
+    /// applies to the whole template.
     private static let hueHarmonies: [[Double]] = [
         [0, 0.07, 0.13],            // analogous - calm, close to one colour
         [0, 0.12, 0.20],            // mid spread
@@ -197,19 +73,72 @@ enum BackgroundArtwork {
     ///
     /// The ~0.08-0.30 gap it leaves out - amber through yellow-green - is
     /// not a matter of taste. Those hues are brown and olive at the
-    /// brightnesses a background behind a call window has to sit at, which
-    /// is the exact mud the brief ruled out. Treating the good part of the
-    /// wheel as one contiguous arc and doing all the harmony arithmetic
-    /// *inside* it, with reflection at the ends, is what makes every
-    /// resulting hue safe by construction - no per-hue checks, no
-    /// after-the-fact clamping, nothing to get wrong when a new harmony is
-    /// added.
+    /// brightnesses a background behind a call window has to sit at,
+    /// which is the exact mud the brief ruled out. Treating the good part
+    /// of the wheel as one contiguous arc and doing all the harmony
+    /// arithmetic *inside* it, with reflection at the ends, is what makes
+    /// every resulting hue safe by construction - no per-hue checks, no
+    /// after-the-fact clamping, nothing to get wrong when a new harmony
+    /// is added.
+    ///
+    /// This is also why the harmony isn't built with DynamicColor's
+    /// `adjustedHue`: that walks the whole wheel and would happily step
+    /// into the dead zone.
     private static let safeArcStart = 0.32
     private static let safeArcLength = 0.68
 
+    /// An abstract gradient derived from `seed`.
+    ///
+    /// Rendered by SwiftUI's `MeshGradient` and rasterized through
+    /// `ImageRenderer`, which is why this is main-actor work rather than
+    /// the pure Core Graphics drawing it replaced. Same canvas, same
+    /// determinism: identical seed and size give an identical bitmap, so
+    /// a recurring meeting keeps its background across recordings and
+    /// across launches.
+    @MainActor
     static func gradient(seed: String, size: CGSize) -> CGImage? {
         var rng = SeededGenerator(seed: seed)
+        let colors = meshColors(&rng)
+        let points = meshPoints(&rng)
 
+        let content = MeshGradient(
+            width: meshSide,
+            height: meshSide,
+            points: points,
+            colors: colors,
+            // Perceptual, for the same reason the ramp is built in Lab:
+            // this is the interpolation that happens *between* the nodes,
+            // and in device space it dips towards grey in exactly the
+            // same way.
+            colorSpace: .perceptual
+        )
+        .frame(width: size.width, height: size.height)
+        .overlay { vignette(size: size) }
+
+        let renderer = ImageRenderer(content: content)
+        // The canvas is already in pixels; letting this follow the screen
+        // would make a 1080p background on a Retina Mac a 4K bitmap that
+        // the composer then throws half of away.
+        renderer.scale = 1
+        return renderer.cgImage
+    }
+
+    /// One colour per mesh node, arranged around a light.
+    ///
+    /// The first version of this ran the palette as a flat ramp along the
+    /// `row + col` diagonal, and it was the wrong shape: a monotone ramp
+    /// interpolated smoothly is a wash, and the mesh might as well have
+    /// been a two-stop linear gradient. Nothing in it said *where* the
+    /// picture was lit from.
+    ///
+    /// So the palette is laid out radially instead. A seeded point inside
+    /// the canvas is the light; hue walks outward from it along the
+    /// harmony, brightness falls away from it, and the far corners get
+    /// shaded hardest. That gives the one thing the ramp couldn't - a
+    /// focal point - and it also puts the darkest parts at the edges,
+    /// which is where a call window needs its background to get out of
+    /// the way.
+    private static func meshColors(_ rng: inout SeededGenerator) -> [Color] {
         // Everything hue-related happens as a position along the safe
         // arc, converted to a real hue only at the point of use.
         let basePosition = rng.double(in: 0...safeArcLength)
@@ -221,254 +150,121 @@ enum BackgroundArtwork {
         // of the seeds came out purple.
         let reach = template.max() ?? 0
         var sign: Double = rng.int(below: 2) == 0 ? -1 : 1
-        let landing = basePosition + reach * sign
-        if landing < 0 || landing > safeArcLength { sign = -sign }
-        let harmony = template.map { $0 * sign }
-        let angle = rng.double(in: 0...(2 * .pi))
-
-        guard let context = makeContext(size: size) else { return nil }
-
-        // A diagonal two-hue base, which is what gives the picture an
-        // overall direction before anything is laid over it.
-        drawLinearGradient(
-            in: context,
-            size: size,
-            colors: [
-                color(hue: hue(basePosition, offset: 0), saturation: 0.74, brightness: 0.42, alpha: 1),
-                color(hue: hue(basePosition, offset: harmony[1] * 0.6), saturation: 0.80, brightness: 0.22, alpha: 1)
-            ],
-            locations: [0, 1],
-            angle: angle
-        )
-
-        // Ribbons, not blobs. A radial gradient's boundary is a circle, so
-        // stacking them gives concentric haze - which is what the previous
-        // version looked like, and is nothing like the references: those
-        // are colour regions meeting along *curves*. A very wide bezier
-        // stroke blurred past recognition is a curve-bounded region, so
-        // that's what these are. Each one enters and leaves off-canvas, so
-        // no stroke end is ever visible as a cap inside the frame.
-        for (index, step) in harmony.enumerated() {
-            let ribbonHue = hue(basePosition, offset: step + rng.double(in: -0.025...0.025) * sign)
-            // One light accent so the flow has a highlight to read
-            // against; the rest stay deep enough to sit behind a call
-            // window without competing with it.
-            let brightness = index == 1
-                ? rng.double(in: 0.66...0.88)
-                : rng.double(in: 0.38...0.62)
-            let ribbon = color(
-                hue: ribbonHue,
-                saturation: rng.double(in: 0.66...0.88),
-                brightness: brightness,
-                alpha: rng.double(in: 0.78...0.95)
-            )
-
-            // The first ribbon is the picture's subject: wide, and routed
-            // through the middle. Without that guarantee a seed could put
-            // every ribbon's curve out past a corner and leave the canvas
-            // as bare base gradient - which happened, and looked like a
-            // flat blue rectangle with a smudge in one corner. The rest
-            // are narrower accents folding across it.
-            let isSubject = index == 0
-            let width = (isSubject ? rng.double(in: 0.62...1.00) : rng.double(in: 0.24...0.58)) * size.height
-
-            context.setStrokeColor(ribbon)
-            context.setLineWidth(width)
-            context.setLineCap(.round)
-            context.setLineJoin(.round)
-            context.addPath(ribbonPath(rng: &rng, size: size, throughCentre: isSubject))
-            context.strokePath()
+        if basePosition + reach * sign < 0 || basePosition + reach * sign > safeArcLength {
+            sign = -sign
         }
 
-        drawVignette(in: context, size: size)
+        // Mid-bright and properly saturated. The version before this sat
+        // at 0.34-0.52 brightness and then shaded on top of that, which
+        // came out as mud - the lesson being that "stays behind the call
+        // window" is the job of the falloff and the vignette, not of
+        // starting from a colour that has nowhere to go.
+        let saturation = rng.double(in: 0.58...0.82)
+        let brightness = rng.double(in: 0.50...0.68)
+        let stops = template.map { offset -> DynamicColor in
+            DynamicColor(
+                hue: CGFloat(hue(basePosition, offset: offset * sign)),
+                saturation: CGFloat(saturation),
+                brightness: CGFloat(brightness),
+                alpha: 1
+            )
+        }
 
-        guard let raw = context.makeImage() else { return nil }
+        // Interpolated in Cie L*a*b*: see `hueHarmonies` - in sRGB the
+        // midpoint between two distant hues is grey, and a mesh gradient
+        // is nothing but midpoints.
+        let steps = 8
+        let ramp = DynamicGradient(colors: stops).colorPalette(amount: UInt(steps), inColorSpace: .lab)
+        guard ramp.count == steps else { return [] }
 
-        // Heavy, and the reason the strokes above can be drawn opaque: at
-        // this radius a stroke edge stops being an edge and becomes the
-        // transition between two colour fields. Blurring past the canvas
-        // and cropping back, because CIGaussianBlur samples transparent
-        // black outside the extent and would otherwise darken all four
-        // sides.
-        let blurred = blur(raw, size: size, radius: Double(size.height) * 0.085) ?? raw
-        return addGrain(to: blurred, size: size, intensity: 0.028) ?? blurred
+        // Kept off-centre: a light in the middle of the frame is exactly
+        // where the call window goes, and the glow would only ever be
+        // seen as a rim around it.
+        let light = SIMD2(rng.double(in: 0.12...0.88), rng.double(in: 0.10...0.55))
+
+        var colors: [Color] = []
+        for row in 0..<meshSide {
+            for col in 0..<meshSide {
+                let u = Double(col) / Double(meshSide - 1)
+                let v = Double(row) / Double(meshSide - 1)
+                // Normalised against the longest distance there can be,
+                // the diagonal, so `near` spans the full 0...1 whatever
+                // corner the light ended up in.
+                let distance = ((u - light.x) * (u - light.x) + (v - light.y) * (v - light.y)).squareRoot()
+                // Nudged per node. Pure distance makes the four nodes of
+                // an edge row almost equidistant from the light, so they
+                // all land on the same colour and the row reads as a
+                // straight band across the bottom of the frame - the one
+                // place the mesh can't hide a seam, because edge points
+                // aren't free to move off their edge. A little noise in
+                // the falloff breaks the row up without touching the
+                // overall shape.
+                let near = min(1, max(0, 1 - distance / 1.4142 + rng.double(in: -0.07...0.07)))
+
+                let color = ramp[min(steps - 1, Int((1 - near) * Double(steps)))]
+                colors.append(Color(nsColor: color
+                    // `lighter` walks HSL lightness, which desaturates as
+                    // it climbs; past about this much the focal point
+                    // goes chalky instead of bright.
+                    .lighter(amount: CGFloat(near * near * 0.15))
+                    // Puts back what `lighter` took out. Without it the
+                    // focal point reads as chalk rather than light.
+                    .saturated(amount: CGFloat(near * 0.12))
+                    .shaded(amount: CGFloat((1 - near) * 0.42))))
+            }
+        }
+        return colors
     }
 
-    /// Converts a position-plus-offset in safe-arc space to a real hue.
+    /// The mesh control points: a regular grid with the interior shaken
+    /// loose.
     ///
-    /// Offsets that run off either end are *reflected*, not wrapped:
-    /// wrapping would jump the short way across the dead zone and land
-    /// exactly in the olive the arc exists to avoid.
+    /// Edge points may slide *along* their edge but never off it, and the
+    /// four corners don't move at all. A control point that leaves the
+    /// unit square pulls the patch with it and leaves the canvas corner
+    /// filled by extrapolation, which is where the washed-out triangles
+    /// in the first attempt came from.
+    private static func meshPoints(_ rng: inout SeededGenerator) -> [SIMD2<Float>] {
+        var points: [SIMD2<Float>] = []
+        for row in 0..<meshSide {
+            for col in 0..<meshSide {
+                let onVerticalEdge = col == 0 || col == meshSide - 1
+                let onHorizontalEdge = row == 0 || row == meshSide - 1
+                let x = Double(col) / Double(meshSide - 1)
+                    + (onVerticalEdge ? 0 : rng.double(in: -meshJitter...meshJitter))
+                let y = Double(row) / Double(meshSide - 1)
+                    + (onHorizontalEdge ? 0 : rng.double(in: -meshJitter...meshJitter))
+                points.append(SIMD2(Float(x), Float(y)))
+            }
+        }
+        return points
+    }
+
+    /// Darkens the corners, which both frames the call window and hides
+    /// the one place a mesh can look mechanical: the straight runs along
+    /// the edges, where the control points aren't free to move.
+    private static func vignette(size: CGSize) -> some View {
+        RadialGradient(
+            colors: [.clear, .black.opacity(0.30)],
+            center: .center,
+            startRadius: size.width * 0.16,
+            endRadius: size.width * 0.75
+        )
+    }
+
+    /// A hue in turns, `offset` from `position`, kept inside the safe arc
+    /// by reflecting at its ends rather than wrapping - wrapping would
+    /// jump the short way across the dead zone and land in exactly the
+    /// olive the arc exists to avoid.
     private static func hue(_ position: Double, offset: Double) -> Double {
         var walked = position + offset
         if walked < 0 { walked = -walked }
         if walked > safeArcLength { walked = 2 * safeArcLength - walked }
-        return wrap(safeArcStart + min(max(walked, 0), safeArcLength))
-    }
-
-    /// A cubic bezier that crosses the canvas, entering and leaving well
-    /// outside it.
-    ///
-    /// Entry and exit are placed on *different* sides, so the curve always
-    /// traverses rather than clipping a corner, and both are pushed a long
-    /// way out so the round caps of a very wide stroke never appear in
-    /// frame. The two control points sit inside the canvas, which is what
-    /// bends the stroke into an S rather than a bar.
-    private static func ribbonPath(rng: inout SeededGenerator, size: CGSize, throughCentre: Bool) -> CGPath {
-        let overshoot = max(size.width, size.height) * 0.55
-
-        // 0 = left, 1 = top, 2 = right, 3 = bottom.
-        let entrySide = rng.int(below: 4)
-        // Any side but the one it came in on.
-        let exitSide = (entrySide + 1 + rng.int(below: 3)) % 4
-
-        func point(onSide side: Int, at t: Double) -> CGPoint {
-            switch side {
-            case 0: return CGPoint(x: -overshoot, y: t * size.height)
-            case 1: return CGPoint(x: t * size.width, y: size.height + overshoot)
-            case 2: return CGPoint(x: size.width + overshoot, y: t * size.height)
-            default: return CGPoint(x: t * size.width, y: -overshoot)
-            }
-        }
-
-        let start = point(onSide: entrySide, at: rng.double(in: 0.1...0.9))
-        let end = point(onSide: exitSide, at: rng.double(in: 0.1...0.9))
-        // Pulled towards the middle for the subject ribbon, free to
-        // wander for the accents.
-        let spread = throughCentre ? 0.22 : 0.45
-        let control1 = CGPoint(
-            x: rng.double(in: (0.35 - spread)...(0.35 + spread)) * size.width,
-            y: rng.double(in: (0.5 - spread)...(0.5 + spread)) * size.height
-        )
-        let control2 = CGPoint(
-            x: rng.double(in: (0.65 - spread)...(0.65 + spread)) * size.width,
-            y: rng.double(in: (0.5 - spread)...(0.5 + spread)) * size.height
-        )
-
-        let path = CGMutablePath()
-        path.move(to: start)
-        path.addCurve(to: end, control1: control1, control2: control2)
-        return path
-    }
-
-    /// A soft darkening towards the corners, drawn as an inverted radial
-    /// gradient in multiply so it deepens what's there rather than laying
-    /// grey over it.
-    private static func drawVignette(in context: CGContext, size: CGSize) {
-        context.setBlendMode(.multiply)
-        let center = CGPoint(x: size.width / 2, y: size.height / 2)
-        drawRadialGradient(
-            in: context,
-            center: center,
-            radius: Double(max(size.width, size.height)) * 0.78,
-            colors: [
-                CGColor(red: 1, green: 1, blue: 1, alpha: 1),
-                CGColor(red: 0.68, green: 0.66, blue: 0.74, alpha: 1)
-            ]
-        )
-        context.setBlendMode(.normal)
-    }
-
-    // MARK: - Drawing helpers
-
-    private static func makeContext(size: CGSize) -> CGContext? {
-        CGContext(
-            data: nil,
-            width: Int(size.width),
-            height: Int(size.height),
-            bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: CGColorSpace(name: CGColorSpace.sRGB)!,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        )
-    }
-
-    private static func color(hue: Double, saturation: Double, brightness: Double, alpha: Double) -> CGColor {
-        let nsColor = NSColor(
-            calibratedHue: hue,
-            saturation: saturation,
-            brightness: brightness,
-            alpha: alpha
-        )
-        return nsColor.usingColorSpace(.sRGB)?.cgColor
-            ?? CGColor(red: 0, green: 0, blue: 0, alpha: alpha)
+        return wrap(safeArcStart + max(0, min(safeArcLength, walked)))
     }
 
     private static func wrap(_ hue: Double) -> Double {
         let value = hue.truncatingRemainder(dividingBy: 1)
         return value < 0 ? value + 1 : value
-    }
-
-    private static func drawLinearGradient(
-        in context: CGContext,
-        size: CGSize,
-        colors: [CGColor],
-        locations: [CGFloat],
-        angle: Double = .pi / 2
-    ) {
-        guard let gradient = CGGradient(
-            colorsSpace: CGColorSpace(name: CGColorSpace.sRGB),
-            colors: colors as CFArray,
-            locations: locations
-        ) else { return }
-        // Long enough that the gradient spans the canvas at any angle.
-        let reach = max(size.width, size.height)
-        let center = CGPoint(x: size.width / 2, y: size.height / 2)
-        let start = CGPoint(x: center.x - cos(angle) * reach, y: center.y - sin(angle) * reach)
-        let end = CGPoint(x: center.x + cos(angle) * reach, y: center.y + sin(angle) * reach)
-        context.drawLinearGradient(gradient, start: start, end: end, options: [.drawsBeforeStartLocation, .drawsAfterEndLocation])
-    }
-
-    private static func drawRadialGradient(in context: CGContext, center: CGPoint, radius: Double, colors: [CGColor]) {
-        guard let gradient = CGGradient(
-            colorsSpace: CGColorSpace(name: CGColorSpace.sRGB),
-            colors: colors as CFArray,
-            locations: [0, 1]
-        ) else { return }
-        context.drawRadialGradient(
-            gradient,
-            startCenter: center, startRadius: 0,
-            endCenter: center, endRadius: radius,
-            options: []
-        )
-    }
-
-    private static let ciContext = CIContext(options: [
-        .workingColorSpace: CGColorSpace(name: CGColorSpace.sRGB)!
-    ])
-
-    private static func blur(_ image: CGImage, size: CGSize, radius: Double) -> CGImage? {
-        let canvas = CGRect(origin: .zero, size: size)
-        let source = CIImage(cgImage: image)
-        guard let filter = CIFilter(name: "CIGaussianBlur") else { return nil }
-        // Clamped first so the blur has something to sample beyond the
-        // edges; without it the border fades to transparent.
-        filter.setValue(source.clampedToExtent(), forKey: kCIInputImageKey)
-        filter.setValue(radius, forKey: kCIInputRadiusKey)
-        guard let output = filter.outputImage?.cropped(to: canvas) else { return nil }
-        return ciContext.createCGImage(output, from: canvas)
-    }
-
-    /// Fine monochrome noise, composited very faintly.
-    ///
-    /// Large smooth gradients are the worst case for an 8-bit encoder -
-    /// they come out in visible stair-step bands. A little grain
-    /// dithers the steps away and costs almost nothing in bitrate at
-    /// this intensity.
-    private static func addGrain(to image: CGImage, size: CGSize, intensity: Double) -> CGImage? {
-        let canvas = CGRect(origin: .zero, size: size)
-        guard let noise = CIFilter(name: "CIRandomGenerator")?.outputImage else { return nil }
-        let grain = noise
-            .cropped(to: canvas)
-            .applyingFilter("CIColorControls", parameters: [
-                kCIInputSaturationKey: 0,
-                kCIInputBrightnessKey: 0,
-                kCIInputContrastKey: 1
-            ])
-            .applyingFilter("CIColorMatrix", parameters: [
-                "inputAVector": CIVector(x: 0, y: 0, z: 0, w: intensity)
-            ])
-        let composited = grain.composited(over: CIImage(cgImage: image)).cropped(to: canvas)
-        return ciContext.createCGImage(composited, from: canvas)
     }
 }

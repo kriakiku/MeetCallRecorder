@@ -45,12 +45,13 @@ actor BackgroundLibrary {
             // be no desktop picture set at all, and the composer already
             // treats a missing background as plain black.
             return Self.desktopPicture(size: size)
-        case .blueprint:
-            return drawn(key: "mat-\(Int(size.width))x\(Int(size.height))") {
-                BackgroundArtwork.cuttingMat(size: size)
-            }
         case .seededGradient:
-            return gradient(seed: seed, size: size)
+            return await gradient(seed: seed, size: size)
+        case .randomGradient:
+            // Not cached: the seed is thrown away, so there would never
+            // be a hit, and keying the cache on it would only grow it by
+            // one dead bitmap per call.
+            return await MainActor.run { BackgroundArtwork.gradient(seed: UUID().uuidString, size: size) }
         case .randomPhoto:
             return await photo(seed: nil, size: size)
         case .seededPhoto:
@@ -58,15 +59,20 @@ actor BackgroundLibrary {
         }
     }
 
-    private func gradient(seed: String, size: CGSize) -> CGImage? {
-        drawn(key: "grad-\(seed)-\(Int(size.width))x\(Int(size.height))") {
-            BackgroundArtwork.gradient(seed: seed, size: size)
-        }
-    }
-
-    private func drawn(key: String, _ make: () -> CGImage?) -> CGImage? {
+    /// Cached per (seed, size) because it isn't free: the mesh is drawn
+    /// by SwiftUI and rasterized, and the photo modes fall back to it,
+    /// so a run with the network down would otherwise rebuild the same
+    /// bitmap for every call.
+    private func gradient(seed: String, size: CGSize) async -> CGImage? {
+        let key = "grad-\(seed)-\(Int(size.width))x\(Int(size.height))"
         if let cached = drawnCache[key] { return cached }
-        guard let image = make() else { return nil }
+        // Hops to the main actor: `MeshGradient` is a SwiftUI view and
+        // `ImageRenderer` is main-actor only. It happens once per call,
+        // before the first segment opens, so it is nowhere near the
+        // sample path.
+        guard let image = await MainActor.run(body: { BackgroundArtwork.gradient(seed: seed, size: size) }) else {
+            return nil
+        }
         drawnCache[key] = image
         return image
     }
@@ -96,7 +102,7 @@ actor BackgroundLibrary {
 
         guard let listing = await listing(query: query, page: page), !listing.isEmpty else {
             log("background: no listing for \(query) p\(page) - falling back to a gradient")
-            return gradient(seed: fallbackSeed, size: size)
+            return await gradient(seed: fallbackSeed, size: size)
         }
         let wallpaper = listing[index % listing.count]
 
@@ -111,12 +117,12 @@ actor BackgroundLibrary {
             try data.write(to: photoURL(id: wallpaper.id))
             guard let image = Self.decode(data, fitting: size) else {
                 log("background: \(wallpaper.id) downloaded but wouldn't decode - falling back to a gradient")
-                return gradient(seed: fallbackSeed, size: size)
+                return await gradient(seed: fallbackSeed, size: size)
             }
             return image
         } catch {
             log("background: download of \(wallpaper.id) failed (\(error)) - falling back to a gradient")
-            return gradient(seed: fallbackSeed, size: size)
+            return await gradient(seed: fallbackSeed, size: size)
         }
     }
 

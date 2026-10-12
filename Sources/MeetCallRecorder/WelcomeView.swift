@@ -89,26 +89,8 @@ struct WelcomeView: View {
 
     // MARK: - Backdrop
 
-    /// Window-coloured base with the mark's gradient bled in behind the
-    /// top of the content. Deliberately built from system colours plus
-    /// opacity so it reads correctly in both light and dark mode without a
-    /// second palette.
     private var backdrop: some View {
-        Color(nsColor: .windowBackgroundColor)
-            .overlay(alignment: .top) {
-                EllipticalGradient(
-                    colors: [
-                        Color(red: 0.42, green: 0.33, blue: 0.98).opacity(0.22),
-                        Color(red: 0.93, green: 0.27, blue: 0.47).opacity(0.10),
-                        .clear
-                    ],
-                    center: .top,
-                    startRadiusFraction: 0,
-                    endRadiusFraction: 0.75
-                )
-                .frame(height: 420)
-            }
-            .ignoresSafeArea()
+        WelcomeBackdrop().ignoresSafeArea()
     }
 
     // MARK: - Page 1: greeting

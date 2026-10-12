@@ -1,0 +1,15 @@
+{
+  "originHash" : "fcb5d77a5eb326f967d1d9e5c976551bf8c18788683dfad0cc946be75005af5f",
+  "pins" : [
+    {
+      "identity" : "dynamiccolor",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/yannickl/DynamicColor.git",
+      "state" : {
+        "revision" : "d9beca13ca85baa50ee29832d0db5129fba69630",
+        "version" : "5.0.1"
+      }
+    }
+  ],
+  "version" : 3
+}

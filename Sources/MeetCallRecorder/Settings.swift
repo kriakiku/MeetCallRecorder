@@ -33,6 +33,43 @@ enum CallSource: String, CaseIterable, Identifiable, Sendable {
         case .slack: return "Slack huddles"
         }
     }
+
+    /// The app's bundle identifier, where it has a fixed one. Google Meet
+    /// has none to give: installed as a Safari web app, its identifier is
+    /// `com.apple.Safari.WebApp.<per-install UUID>`, so it can only be
+    /// found by name. See AppIcons.
+    var bundleIdentifier: String? {
+        switch self {
+        case .googleMeet: return nil
+        case .slack: return "com.tinyspeck.slackmacgap"
+        }
+    }
+
+    /// Stands in for the app's own icon when it isn't installed - or, for
+    /// Meet, when the web app hasn't been created yet.
+    var fallbackSymbol: String {
+        switch self {
+        case .googleMeet: return "video.fill"
+        case .slack: return "bubble.left.and.bubble.right.fill"
+        }
+    }
+
+    /// What has to be true before detection can work at all, or nil when
+    /// installing the app is enough.
+    var requirement: String? {
+        switch self {
+        case .googleMeet:
+            // Detection matches on window owner and title. A call in an
+            // ordinary browser tab is owned by Safari or Chrome and titled
+            // whatever the tab is, so there is nothing to recognise - only
+            // the standalone web app reports itself as "Google Meet".
+            return "Only calls in Google Meet installed as a Safari web app (Safari › File › Add to Dock). Meet in a normal browser tab isn't detected."
+        case .slack:
+            // A huddle is recognised by its window title, and that title is
+            // localized - "Huddle" is what an English Slack puts there.
+            return "Only tested with Slack set to English. Huddles are matched by their window title, so another display language probably won't be detected."
+        }
+    }
 }
 
 enum CaptureMode: String, CaseIterable, Identifiable, Sendable {
@@ -104,12 +141,56 @@ enum RecordingQuality: String, CaseIterable, Identifiable, Codable, Sendable {
         }
     }
 
+    /// The AAC track every recording carries, picture or not - the rate
+    /// `RecordingAssembler` encodes at.
+    private static let audioBitrate = 128_000
+
+    /// Frame rate is fixed for every quality - the setting changes the
+    /// canvas, not the cadence - so this reads straight off the capture
+    /// constant rather than varying per case.
+    var frameRateLabel: String? {
+        isAudioOnly ? nil : "\(CallRecorder.frameRate) fps"
+    }
+
+    /// What the *finished* file is encoded at. Staging deliberately runs
+    /// far higher (see `stagingBitrate`), but that pass is an intermediate
+    /// nobody keeps, so quoting it here would only overstate the cost.
+    var bitrateLabel: String {
+        guard !isAudioOnly else { return "\(Self.audioBitrate / 1_000) kbps" }
+        let mbps = Double(outputBitrate) / 1_000_000
+        return "\(mbps.formatted(.number.precision(.fractionLength(0...1)))) Mbps"
+    }
+
+    /// "1920×1080 · 30 fps · 5 Mbps", or the audio format when there's no
+    /// picture to describe.
+    var formatLabel: String {
+        guard let size = outputSize, let frameRateLabel else {
+            return "AAC \(bitrateLabel) · 48 kHz stereo"
+        }
+        return "\(Int(size.width))×\(Int(size.height)) · \(frameRateLabel) · \(bitrateLabel)"
+    }
+
+    /// Roughly what half an hour of call costs on disk at this quality.
+    ///
+    /// Derived from the bitrates above rather than measured, so it tracks
+    /// them if they're ever retuned. It's an upper-ish bound: the encoder
+    /// targets an average rate, and a mostly-static screen share spends
+    /// well under its budget.
+    var estimatedHalfHourBytes: Int64 {
+        let seconds = 30.0 * 60.0
+        return Int64(Double(outputBitrate + Self.audioBitrate) * seconds / 8.0)
+    }
+
+    var estimatedHalfHourLabel: String {
+        "≈\(estimatedHalfHourBytes.formatted(.byteCount(style: .file)))"
+    }
+
     var summary: String {
         switch self {
-        case .p720: return "1280×720 · smallest files"
-        case .p1080: return "1920×1080 · the default"
-        case .p1440: return "2560×1440 · sharpest, largest files"
-        case .audioOnly: return "No picture · saved as .m4a"
+        case .p720: return "\(formatLabel) · smallest files"
+        case .p1080: return "\(formatLabel) · the default"
+        case .p1440: return "\(formatLabel) · sharpest, largest files"
+        case .audioOnly: return "No picture · \(formatLabel) · saved as .m4a"
         }
     }
 }
